@@ -192,16 +192,16 @@ class BacktestEngine:
             raise ValueError("rebalance_dates must be non-empty")
 
     def _get_regime_asof(self, macro_df: pd.DataFrame, rb_date: pd.Timestamp) -> int:
-        asof = macro_df.loc[macro_df.index <= rb_date]
+        asof = macro_df.loc[macro_df.index < rb_date]
         if asof.empty:
-            raise ValueError(f"No macro regime data on or before {rb_date}")
+            raise ValueError(f"No macro regime data before {rb_date}")
         regime = int(asof["regime"].iloc[-1])
         if regime not in (0, 1, 2):
             raise ValueError(f"Invalid regime {regime}; must be 0, 1, or 2")
         return regime
 
     def _extract_tickers(self, alpha_df: pd.DataFrame, rb_date: pd.Timestamp) -> List[str]:
-        sub = alpha_df[(alpha_df["date"] <= rb_date)].dropna(subset=["alpha_score"])
+        sub = alpha_df[(alpha_df["date"] < rb_date)].dropna(subset=["alpha_score"])
         if sub.empty:
             return []
         last_date = sub["date"].max()
@@ -214,7 +214,7 @@ class BacktestEngine:
         rb_date: pd.Timestamp,
         tickers: List[str],
     ) -> Optional[pd.DataFrame]:
-        mask = price_df.index <= rb_date
+        mask = price_df.index < rb_date
         window = price_df.loc[mask, tickers].iloc[-self._trailing_days :]
         if window.empty or len(window) < 2:
             return None
@@ -234,7 +234,7 @@ class BacktestEngine:
         mults: dict[str, float] = {}
         for t in tickers:
             news_sub = news_df[
-                (news_df["ticker"] == t) & (news_df["date"] <= rb_date)
+                (news_df["ticker"] == t) & (news_df["date"] < rb_date)
             ].sort_values("date", ascending=False)
             if news_sub.empty:
                 mults[t] = 1.0
@@ -248,7 +248,9 @@ class BacktestEngine:
                 else:
                     days_since = len(
                         pd.bdate_range(
-                            event_date + pd.Timedelta(days=1), rb_date
+                            event_date + pd.Timedelta(days=1),
+                            rb_date,
+                            inclusive="left",
                         )
                     )
                     mults[t] = self._nlp_sentinel.get_risk_multiplier(
@@ -265,7 +267,7 @@ class BacktestEngine:
         cum_equity: float,
         peak_equity: float,
     ) -> tuple[float, float]:
-        mask = (price_df.index > start) & (price_df.index <= end)
+        mask = (price_df.index > start) & (price_df.index < end)
         period = price_df.loc[mask]
         tickers = [t for t in prev_weights if t in period.columns]
         w_vec = np.array([prev_weights[t] for t in tickers])
@@ -303,7 +305,7 @@ class BacktestEngine:
         rb_date: pd.Timestamp,
         tickers: List[str],
     ) -> pd.Series:
-        mask = price_df.index <= rb_date
+        mask = price_df.index < rb_date
         window = price_df.loc[mask, tickers].iloc[-ROLLING_VOL_DAYS:]
         vols = window.std() * np.sqrt(TRADING_DAYS_YEAR)
         if (vols <= 0).any() or vols.isna().any():
