@@ -1,12 +1,12 @@
-# Trinity Stack v9.0
+# Trinity Stack — Portfolio Management System
 
-Institutional-grade monthly rebalanced trading system for Nordic Small Caps (OMXH/OMXS). Six-layer architecture with strict point-in-time semantics, no look-ahead bias, and fail-fast validation.
+Institutional-grade monthly rebalanced trading system for Nordic Small Caps. Six-layer architecture with strict point-in-time semantics, no look-ahead bias, and fail-fast validation.
 
 ---
 
 ## Features
 
-- **Point-in-time safe** — All features use strictly past data; fundamental data lagged T+2 minimum
+- **Point-in-time safe** — All features use strictly past data; fundamental data lagged appropriately
 - **No survivorship bias** — Universe includes delisted securities; monthly snapshots reflect true tradable set
 - **Reproducible** — Fixed global random seed; deterministic ML and clustering
 - **Fail-fast** — Raises on missing data, NaN propagation, or dimension mismatch
@@ -26,12 +26,28 @@ Layer 6: Execution & TCA         → Orders + SQLite logging
 
 | Layer | Module | Output |
 |-------|--------|--------|
-| **L1** | Feature engineering | Quality Score, SUE, Amihud, Vol Compression, January effect, SMA distance |
-| **L2** | Macro HMM + Liquidity overlay | Regime state (0/1/2), liquidity stress |
+| **L1** | Feature engineering | Quality Score, SUE, Amihud, Vol Compression, seasonality features, trend metrics |
+| **L2** | Macro HMM + Liquidity overlay | Regime state (multi-state), liquidity stress indicator |
 | **L3** | Momentum + LightGBM + IC ensemble | Alpha scores (ranked) |
 | **L4** | NLP Sentinel | Risk multipliers (negative event penalties) |
 | **L5** | HRP + dynamic vol target | Target weights |
 | **L6** | Execution engine + TCA | Limit orders, stop-loss, SQLite logs |
+
+---
+
+## Layer Details (High-Level)
+
+**Layer 1** — PEAD/SUE, quality composite (ROIC, Piotroski, Accruals), Amihud illiquidity, volatility compression, seasonality, trend-shield features.
+
+**Layer 2** — HMM on macro factors; persistence rule for regime stability; liquidity overlay on spread expansion beyond historical norm.
+
+**Layer 3** — Hard filters (quality, spread, volume); cross-sectional momentum (with short-term reversal exclusion); LightGBM on fundamentals and microstructure; IC stability weighting; turnover hysteresis.
+
+**Layer 4** — Transformer-based sentiment on corporate actions; penalty for extreme negative events with exponential recovery decay.
+
+**Layer 5** — Currency-isolated HRP; inverse volatility intra-cluster; dynamic vol target; drawdown overlay.
+
+**Layer 6** — Conviction-scaled limit pricing; Expected Shortfall stop-loss; TCA logging.
 
 ---
 
@@ -57,7 +73,7 @@ pip install -r requirements.txt
 python run_pipeline.py
 ```
 
-Loads data from `data/raw/` (or generates mock data if missing), runs all six layers, and logs theoretical trades to `data/tca/tca.db`.
+Loads data from `data/raw/` (or generates mock data if missing), runs all six layers, and logs theoretical trades to SQLite.
 
 ### Launch TCA dashboard
 
@@ -93,25 +109,13 @@ trinity_stack/
 
 ## Data
 
-Place parquet files in `data/raw/`:
-
-| File | Columns |
-|------|---------|
-| `prices.parquet` | date, ticker, PX_LAST, PX_VOLUME, BID_ASK_SPREAD_PCT |
-| `fundamentals.parquet` | report_date, ticker, ACTUAL_EPS, CONSENSUS_EPS, EPS_STD, ROIC, Piotroski_F, Accruals |
-| `macro.parquet` | index=date, V2TX, Breadth, Rates |
-| `news.parquet` | ticker, date, text |
-
-If files are missing, the pipeline generates mock data.
+Place parquet files in `data/raw/` with standard market data schemas (price, volume, spreads, fundamentals, macro series, news). If files are missing, the pipeline generates mock data.
 
 ---
 
 ## Configuration
 
-- **Random seed:** `GLOBAL_SEED = 42`
-- **Regime:** 3-day persistence; 70% confidence threshold
-- **Vol target:** 80% of 5-year median realized vol
-- **Drawdown cut:** −10% DD → reduce gross exposure by 20%
+All thresholds, windows, and parameters are configurable at instantiation. The system is designed for institutional production use with sensible defaults.
 
 ---
 
