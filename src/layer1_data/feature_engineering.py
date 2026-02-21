@@ -13,7 +13,7 @@ import pandas as pd
 
 T_PLUS_2_DAYS = 2
 
-PRICE_REQUIRED: List[str] = ["date", "ticker", "PX_LAST", "PX_VOLUME", "BID_ASK_SPREAD_PCT"]
+PRICE_REQUIRED: List[str] = ["date", "ticker", "PX_LAST", "PX_TURN_OVER", "BID_ASK_SPREAD_PCT"]
 FUND_REQUIRED: List[str] = [
     "report_date",
     "ticker",
@@ -21,7 +21,7 @@ FUND_REQUIRED: List[str] = [
     "CONSENSUS_EPS",
     "EPS_STD",
     "ROIC",
-    "Piotroski_F",
+    "Dilution",
     "Accruals",
 ]
 LAYER3_OUTPUT_COLS: List[str] = [
@@ -29,7 +29,7 @@ LAYER3_OUTPUT_COLS: List[str] = [
     "ticker",
     "Quality_Score",
     "BID_ASK_SPREAD_PCT",
-    "PX_VOLUME",
+    "PX_TURN_OVER",
     "SUE",
     "Amihud",
     "Vol_Compression",
@@ -62,13 +62,13 @@ def calculate_sue(
 
 def calculate_quality(
     roic: pd.Series,
-    f_score: pd.Series,
-    accruals: pd.Series,
+    dilution: pd.Series,
     grouper: pd.Series | None = None,
 ) -> pd.Series:
     """
-    Quality = Z(ROIC) + Z(F_Score) - Z(Accruals).
-    Cross-sectional z-scores. grouper: series for grouping (e.g. date). NaN -> 0.
+    Quality = Z(ROIC) - Z(Dilution).
+    Cross-sectional z-scores. High dilution (share issuance) is bad.
+    grouper: series for grouping (e.g. date). NaN -> 0.
     """
     grp = grouper if grouper is not None else pd.Series(roic.index, index=roic.index)
     def _z(s: pd.Series) -> pd.Series:
@@ -76,7 +76,7 @@ def calculate_quality(
             lambda x: (x - x.mean()) / x.std() if x.std() > 1e-10 else 0.0
         )
         return t.fillna(0)
-    return _z(roic) + _z(f_score) - _z(accruals)
+    return _z(roic) - _z(dilution)
 
 
 def calculate_amihud(
@@ -119,8 +119,8 @@ class FeatureEngineer:
             if col not in raw_fundamentals_df.columns:
                 raise ValueError(f"raw_fundamentals_df missing: {col}")
 
-        if raw_price_df[["PX_LAST", "PX_VOLUME"]].isna().any().any():
-            raise ValueError("NaNs in PX_LAST or PX_VOLUME. Fail-fast.")
+        if raw_price_df[["PX_LAST", "PX_TURN_OVER"]].isna().any().any():
+            raise ValueError("NaNs in PX_LAST or PX_TURN_OVER. Fail-fast.")
 
         price = raw_price_df.copy()
         price["date"] = pd.to_datetime(price["date"])
@@ -166,12 +166,11 @@ class FeatureEngineer:
 
         merged["Quality_Score"] = calculate_quality(
             merged["ROIC"],
-            merged["Piotroski_F"],
-            merged["Accruals"],
+            merged["Dilution"],
             grouper=merged["date"],
         ).fillna(0)
 
-        merged["Amihud"] = calculate_amihud(merged["Return"], merged["PX_VOLUME"])
+        merged["Amihud"] = calculate_amihud(merged["Return"], merged["PX_TURN_OVER"])
         merged["Vol_Compression"] = merged.groupby("ticker")["Return"].transform(
             calculate_vol_compression
         )
@@ -182,7 +181,7 @@ class FeatureEngineer:
                 "ticker",
                 "Quality_Score",
                 "BID_ASK_SPREAD_PCT",
-                "PX_VOLUME",
+                "PX_TURN_OVER",
                 "SUE",
                 "Amihud",
                 "Vol_Compression",

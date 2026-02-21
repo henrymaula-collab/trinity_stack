@@ -66,7 +66,7 @@ def apply_market_impact(
 
     px = raw_prices.copy()
     px["date"] = pd.to_datetime(px["date"])
-    vol_df = px.pivot_table(index="date", columns="ticker", values="PX_VOLUME")
+    turnover_df = px.pivot_table(index="date", columns="ticker", values="PX_TURN_OVER")
     price_df = px.pivot_table(index="date", columns="ticker", values="PX_LAST")
 
     ret = equity_before_impact.pct_change().fillna(0)
@@ -85,13 +85,13 @@ def apply_market_impact(
             for t, w_new in new_weights.items():
                 w_old = prev_weights.get(t, 0.0)
                 delta = abs(w_new - w_old)
-                if delta < 1e-9 or t not in vol_df.columns or t not in price_df.columns:
+                if delta < 1e-9 or t not in turnover_df.columns:
                     continue
                 order_dollars = delta * pv_val
-                vol_idx = vol_df.index[vol_df.index <= rb_date]
-                if vol_idx.empty:
+                turn_idx = turnover_df.index[turnover_df.index <= rb_date]
+                if turn_idx.empty:
                     continue
-                vd = vol_df.loc[vol_idx[-1], t] * price_df.loc[vol_idx[-1], t]
+                vd = turnover_df.loc[turn_idx[-1], t]  # PX_TURN_OVER = daily traded value (fiat)
                 if pd.isna(vd) or vd <= 0:
                     continue
                 order_pct = min(order_dollars / vd, 1.0)

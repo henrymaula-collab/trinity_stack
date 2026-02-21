@@ -40,7 +40,7 @@ def _load_parquet_or_mock(name: str) -> pd.DataFrame:
                 base_px = max(1.0, base_px * (1 + ret))
                 records.append({
                     "date": pd.Timestamp(d), "ticker": f"T_{t:02d}",
-                    "PX_LAST": base_px, "PX_VOLUME": max(100, int(np.random.lognormal(10, 1))),
+                    "PX_LAST": base_px, "PX_TURN_OVER": max(1000.0, float(np.random.lognormal(12, 1))),
                     "BID_ASK_SPREAD_PCT": np.random.uniform(0.005, 0.04),
                 })
         return pd.DataFrame(records)
@@ -55,7 +55,7 @@ def _load_parquet_or_mock(name: str) -> pd.DataFrame:
                     "ACTUAL_EPS": actual, "CONSENSUS_EPS": actual + np.random.randn() * 0.2,
                     "EPS_STD": max(0.1, np.abs(np.random.randn()) * 0.3),
                     "ROIC": np.random.uniform(0.02, 0.25),
-                    "Piotroski_F": int(np.clip(np.random.randint(0, 9), 0, 9)),
+                    "Dilution": np.random.uniform(0.8, 1.5),
                     "Accruals": np.random.randn() * 0.05,
                 })
         return pd.DataFrame(records)

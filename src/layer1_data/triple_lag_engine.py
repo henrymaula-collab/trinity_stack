@@ -19,7 +19,7 @@ class TripleLagEngine:
     Eliminates look-ahead bias and data leakage.
     """
 
-    T0_COLS: List[str] = ["date", "PX_LAST", "PX_VOLUME"]
+    T0_COLS: List[str] = ["date", "PX_LAST", "PX_TURN_OVER"]
 
     def __init__(
         self,
@@ -43,8 +43,8 @@ class TripleLagEngine:
     def process_asset(self, df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         if "date" not in df.columns:
             raise ValueError(f"[{ticker}] Missing 'date' column.")
-        if "PX_LAST" not in df.columns or "PX_VOLUME" not in df.columns:
-            raise ValueError(f"[{ticker}] Missing required columns: PX_LAST, PX_VOLUME.")
+        if "PX_LAST" not in df.columns or "PX_TURN_OVER" not in df.columns:
+            raise ValueError(f"[{ticker}] Missing required columns: PX_LAST, PX_TURN_OVER.")
 
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
@@ -52,7 +52,7 @@ class TripleLagEngine:
         df = df.sort_values("date").reset_index(drop=True)
 
         df["Return"] = df["PX_LAST"].pct_change()
-        safe_volume = df["PX_VOLUME"].replace(0, np.nan)
+        safe_volume = df["PX_TURN_OVER"].replace(0, np.nan)
         df["Amihud_Illiq"] = np.abs(df["Return"]) / safe_volume
 
         if "ACTUAL_EPS" in df.columns and "CONSENSUS_EPS" in df.columns:

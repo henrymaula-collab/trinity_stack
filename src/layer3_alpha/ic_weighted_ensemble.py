@@ -16,7 +16,7 @@ REQUIRED_COLS: List[str] = [
     "date",
     "Quality_Score",
     "BID_ASK_SPREAD_PCT",
-    "PX_VOLUME",
+    "PX_TURN_OVER",
     "signal_lgbm",
     "signal_mom",
     "forward_return",
@@ -54,8 +54,8 @@ class AlphaEnsemble:
 
     def _apply_hard_filters(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        df = df.dropna(subset=["Quality_Score", "BID_ASK_SPREAD_PCT", "PX_VOLUME"])
-        df = df[df["PX_VOLUME"] > 0]
+        df = df.dropna(subset=["Quality_Score", "BID_ASK_SPREAD_PCT", "PX_TURN_OVER"])
+        df = df[df["PX_TURN_OVER"] > 0]
         df = df[df["BID_ASK_SPREAD_PCT"] <= self.spread_max]
         by_date = df.groupby("date", as_index=False)
         quantile = by_date["Quality_Score"].transform(

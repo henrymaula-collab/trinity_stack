@@ -18,7 +18,7 @@ def create_mock_layer3_data(n_dates=80, n_tickers=20):
                 "ticker": f"TICK_{t}",
                 "Quality_Score": np.random.uniform(0, 100),
                 "BID_ASK_SPREAD_PCT": np.random.uniform(0.005, 0.05), # Medvetet > 0.03 för att testa filter
-                "PX_VOLUME": np.random.choice([0, 1000, 5000]),       # Medvetet nollor för att testa filter
+                "PX_TURN_OVER": np.random.choice([0.0, 1000.0, 5000.0]),  # Medvetet nollor för filtertest
                 "signal_lgbm": np.random.normal(0, 1),
                 "signal_mom": np.random.normal(0, 1),
                 "forward_return": np.random.normal(0, 0.02)
@@ -37,7 +37,7 @@ def run_tests():
     
     # 1.1 Validera Hard Filters
     assert res["BID_ASK_SPREAD_PCT"].max() <= 0.03, "❌ FEL: Spread-filtret släppte igenom illikvida aktier."
-    assert res["PX_VOLUME"].min() > 0, "❌ FEL: Volym-filtret släppte igenom otillgängliga aktier."
+    assert res["PX_TURN_OVER"].min() > 0, "❌ FEL: Omsättningsfiltret släppte igenom otillgängliga aktier."
     
     # 1.2 Validera Boundaries [0.3, 0.7] (Kollar raderna efter burn-in perioden på 63 dgr)
     valid_weights = res.dropna(subset=["w_mom", "w_lgbm"])

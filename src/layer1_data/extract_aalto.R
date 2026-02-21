@@ -9,10 +9,10 @@ suppressPackageStartupMessages({
   library(dplyr)
 })
 
-REQUIRED_COLS <- c("date", "ticker", "PX_LAST", "PX_VOLUME")
+REQUIRED_COLS <- c("date", "ticker", "PX_LAST", "PX_TURN_OVER")
 RAW_DIR <- "data/raw"
 OPTIONAL_COLS <- c("BID_ASK_SPREAD_PCT", "Quality_Score", "ACTUAL_EPS", "CONSENSUS_EPS",
-                   "ROIC", "Piotroski_F", "Accruals")
+                   "ROIC", "Dilution", "Accruals")
 
 main <- function(input_path = "data/sources/aalto_equity_export.csv") {
   if (!file.exists(input_path)) {

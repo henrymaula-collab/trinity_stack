@@ -37,7 +37,7 @@ Layer 6: Execution & TCA         → Orders + SQLite logging
 
 ## Layer Details (High-Level)
 
-**Layer 1** — PEAD/SUE, quality composite (ROIC, Piotroski, Accruals), Amihud illiquidity, volatility compression, seasonality, trend-shield features.
+**Layer 1** — PEAD/SUE, quality composite (Z(ROIC) - Z(Dilution)), Amihud illiquidity (PX_TURN_OVER), volatility compression, seasonality, trend-shield features.
 
 **Layer 2** — HMM on macro factors; persistence rule for regime stability; liquidity overlay on spread expansion beyond historical norm.
 
@@ -89,6 +89,15 @@ streamlit run dashboard/streamlit_app.py
 trinity_stack/
 ├── run_pipeline.py          # Master orchestrator (L1–L6)
 ├── requirements.txt
+├── research/                # Academic hypothesis testing (isolated)
+│   ├── 01_ablation_study.py
+│   ├── 02_market_impact.py
+│   ├── 03_statistical_robustness.py
+│   ├── 04_champion_vs_challenger.py
+│   ├── 05_tearsheet_and_benchmarks.py
+│   └── README.md
+├── docs/
+│   └── BLOOMBERG_BLPAPI_DATA_INSTRUCTIONS.md
 ├── data/
 │   ├── raw/                 # Parquet: prices, fundamentals, macro, news
 │   └── tca/                 # SQLite TCA log

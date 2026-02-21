@@ -65,7 +65,7 @@ def _load_parquet_or_mock(name: str) -> pd.DataFrame:
                     "date": pd.Timestamp(d),
                     "ticker": f"T_{t:02d}",
                     "PX_LAST": base_px,
-                    "PX_VOLUME": max(100, int(np.random.lognormal(10, 1))),
+                    "PX_TURN_OVER": max(1000.0, float(np.random.lognormal(12, 1))),
                     "BID_ASK_SPREAD_PCT": np.random.uniform(0.005, 0.04),
                 })
         return pd.DataFrame(records)
@@ -84,7 +84,7 @@ def _load_parquet_or_mock(name: str) -> pd.DataFrame:
                     "CONSENSUS_EPS": consensus,
                     "EPS_STD": max(0.1, np.abs(np.random.randn()) * 0.3),
                     "ROIC": np.random.uniform(0.02, 0.25),
-                    "Piotroski_F": int(np.clip(np.random.randint(0, 9), 0, 9)),
+                    "Dilution": np.random.uniform(0.8, 1.5),
                     "Accruals": np.random.randn() * 0.05,
                 })
         return pd.DataFrame(records)
@@ -121,7 +121,7 @@ def load_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]
     macro = _load_parquet_or_mock("macro")
     news = _load_parquet_or_mock("news")
 
-    for col in ["date", "ticker", "PX_LAST", "PX_VOLUME", "BID_ASK_SPREAD_PCT"]:
+    for col in ["date", "ticker", "PX_LAST", "PX_TURN_OVER", "BID_ASK_SPREAD_PCT"]:
         if col not in prices.columns:
             raise ValueError(f"prices missing column: {col}")
     for col in ["V2TX", "Breadth", "Rates"]:

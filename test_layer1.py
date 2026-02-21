@@ -15,7 +15,7 @@ def create_synthetic_data(file_path: Path, corrupt_dates: bool = False):
     df = pd.DataFrame({
         "date": dates,
         "PX_LAST": np.linspace(100, 150, 100),
-        "PX_VOLUME": np.random.randint(1000, 50000, 100),
+        "PX_TURN_OVER": np.random.uniform(1000, 50000, 100),
         "ACTUAL_EPS": np.linspace(1.0, 2.0, 100),
         "CONSENSUS_EPS": np.linspace(0.9, 1.9, 100),
         "ROIC": np.random.uniform(0.05, 0.15, 100)

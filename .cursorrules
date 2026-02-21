@@ -32,7 +32,7 @@ You are a senior Quantitative Developer building an institutional-grade monthly 
 * Output: Clean monthly feature matrix (PiT safe).
 * Features:
   - PEAD / SUE: (Actual EPS - Consensus EPS) / std(EPS Forecast Error).
-  - Quality Composite: ROIC, Piotroski F-Score, Accruals.
+  - Quality Composite: Z(ROIC) - Z(Dilution). Dilution = EQY_SH_OUT_t / EQY_SH_OUT_{t-1y}.
   - Amihud Illiquidity: abs(Return) / Volume.
   - Cross-Sectional Volatility Compression.
 
