@@ -117,4 +117,4 @@ If files are missing, the pipeline generates mock data.
 
 ## License
 
-MIT (or specify your license)
+All Rights Reserved
