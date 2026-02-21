@@ -40,8 +40,23 @@ class MacroRegimeDetector:
     def fit(self, X: pd.DataFrame | np.ndarray) -> MacroRegimeDetector:
         arr = self._validate_and_extract(X)
         self._hmm.fit(arr)
+        self._reorder_states_by_variance()
         self._fitted = True
         return self
+
+    def _reorder_states_by_variance(self) -> None:
+        """
+        HMM outputs unordered states. Reorder so: 0=lowest var (Bull),
+        1=middle (Neutral), 2=highest (Crisis).
+        """
+        variances = np.array(
+            [np.trace(self._hmm.covars_[k]) for k in range(self.n_states)]
+        )
+        perm = np.argsort(variances)  # ascending: low, mid, high
+        self._hmm.means_ = self._hmm.means_[perm]
+        self._hmm.covars_ = self._hmm.covars_[perm]
+        self._hmm.transmat_ = self._hmm.transmat_[perm, :][:, perm]
+        self._hmm.startprob_ = self._hmm.startprob_[perm]
 
     def _validate_and_extract(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
         if isinstance(X, pd.DataFrame):
