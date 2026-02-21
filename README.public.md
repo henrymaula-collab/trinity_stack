@@ -89,11 +89,6 @@ streamlit run dashboard/streamlit_app.py
 trinity_stack/
 ├── run_pipeline.py          # Master orchestrator (L1–L6)
 ├── requirements.txt
-├── research/                # Academic hypothesis testing (isolated)
-│   ├── 01_ablation_study.py
-│   ├── 02_market_impact.py
-│   ├── 03_statistical_robustness.py
-│   └── README.md
 ├── data/
 │   ├── raw/                 # Parquet: prices, fundamentals, macro, news
 │   └── tca/                 # SQLite TCA log
