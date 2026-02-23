@@ -44,48 +44,99 @@ fund_fields <- c(
   "BEST_EPS_EST_STD_DEV",
   "RETURN_ON_INVESTED_CAPITAL",
   "EQY_SH_OUT",
-  "ACCRUAL_RATIO"
+  "ACCRUAL_RATIO",
+  "BEST_DIV_YLD",    # Uppskattning; gles för nordiska småbolag utan analytikertäckning
+  "DIVIDEND_YIELD",  # Historisk/trailing; fallback när BEST_DIV_YLD saknas
+  "CUR_MKT_CAP"      # Marknadsvärde; använd aldrig PX_VOLUME för värdering
 )
 opt <- c(periodicitySelection = "QUARTERLY")
+
+# ---- Tracker: Hoppa över Success ----
+FUND_STATUS_LOG <- file.path(OUTPUT_DIR, "fundamentals_status_log.csv")
+if (file.exists(FUND_STATUS_LOG)) {
+  fund_status <- read.csv(FUND_STATUS_LOG, stringsAsFactors = FALSE)
+  success_tick <- fund_status$Ticker[fund_status$Status == "Success"]
+  TICKERS_PENDING <- setdiff(TICKERS, success_tick)
+  cat(sprintf("Tracker: %d Success (hoppas över), %d kvar\n", length(success_tick), length(TICKERS_PENDING)))
+} else {
+  fund_status <- data.frame(Ticker = character(0), Status = character(0), stringsAsFactors = FALSE)
+  TICKERS_PENDING <- TICKERS
+}
+
 fund_list <- list()
-batches <- split(TICKERS, ceiling(seq_along(TICKERS) / FUND_BATCH_SIZE))
-for (b in seq_along(batches)) {
-  chunk <- batches[[b]]
-  cat(sprintf("  Fundamentals batch %d/%d: %d tickers\n", b, length(batches), length(chunk)))
-  for (ticker in chunk) {
-    tryCatch({
-      df <- bdh(ticker, fund_fields, START_DATE, END_DATE, options = opt)
-      if (!is.null(df) && nrow(df) > 0) {
-        df$ticker <- gsub(" Equity$", "", ticker)
-        fund_list[[ticker]] <- df
-      }
-    }, error = function(e) invisible(NULL))
+for (ticker in TICKERS_PENDING) {
+  res <- tryCatch({
+    df <- bdh(ticker, fund_fields, START_DATE, END_DATE, options = opt)
+    if (is.null(df) || nrow(df) == 0) {
+      list(status = "Failed", data = NULL)
+    } else {
+      df$ticker <- gsub(" Equity$", "", ticker)
+      list(status = "Success", data = df)
+    }
+  }, error = function(e) {
+    list(status = "Failed", data = NULL)
+  })
+  # Uppdatera tracker-loggen utan att skapa dubbletter
+  idx <- which(fund_status$Ticker == ticker)
+  if (length(idx) > 0) {
+    fund_status$Status[idx] <- res$status
+  } else {
+    fund_status <- rbind(fund_status, data.frame(Ticker = ticker, Status = res$status, stringsAsFactors = FALSE))
   }
+  if (!is.null(res$data)) fund_list[[ticker]] <- res$data
 }
+write.csv(fund_status, FUND_STATUS_LOG, row.names = FALSE)
+# Slå ihop nya (bind_rows) + befintliga parquet
+# Inkludera data för redan Success-tickers från tidigare körning
 fund_list_valid <- fund_list[!sapply(fund_list, is.null)]
-if (length(fund_list_valid) == 0) {
-  stop("Inga fundamentals hämtade. Kontrollera tickers och Bloomberg.", call. = FALSE)
+fund_path <- file.path(OUTPUT_DIR, "fundamentals.parquet")
+fundamentals_new <- if (length(fund_list_valid) > 0) bind_rows(fund_list_valid) else NULL
+if (!is.null(fundamentals_new) && file.exists(fund_path)) {
+  fund_existing <- read_parquet(fund_path)
+  ticker_col <- if ("ticker" %in% names(fund_existing)) "ticker" else "Ticker"
+  # Säker filtrering för att undvika dubbletter vid uppdatering
+  fund_existing <- fund_existing %>%
+    filter(!(!!sym(ticker_col) %in% TICKERS_PENDING))
+  fundamentals_raw <- bind_rows(fund_existing, fundamentals_new)
+} else if (!is.null(fundamentals_new)) {
+  fundamentals_raw <- fundamentals_new
+} else if (file.exists(fund_path)) {
+  fundamentals_raw <- read_parquet(fund_path)
+} else {
+  stop("Inga fundamentals hämtade och ingen befintlig fil.", call. = FALSE)
 }
-fundamentals_raw <- bind_rows(fund_list_valid)
 
 # Namngivning för Trinity
 if (nrow(fundamentals_raw) > 0) {
-  fundamentals_df <- fundamentals_raw %>%
-    rename(
-      report_date = date,
-      ACTUAL_EPS = BEST_EPS,
-      EPS_STD = BEST_EPS_EST_STD_DEV,
-      ROIC = RETURN_ON_INVESTED_CAPITAL,
-      Accruals = ACCRUAL_RATIO
-    )
+  fundamentals_df <- fundamentals_raw
+  if ("date" %in% names(fundamentals_df) && !"report_date" %in% names(fundamentals_df)) {
+    fundamentals_df <- fundamentals_df %>% rename(report_date = date)
+  }
+  renames <- list(ACTUAL_EPS = "BEST_EPS", EPS_STD = "BEST_EPS_EST_STD_DEV",
+                  ROIC = "RETURN_ON_INVESTED_CAPITAL", Accruals = "ACCRUAL_RATIO")
+  for (nn in names(renames)) {
+    if (renames[[nn]] %in% names(fundamentals_df)) {
+      fundamentals_df <- fundamentals_df %>% rename(!!nn := !!sym(renames[[nn]]))
+    }
+  }
   # CONSENSUS_EPS: fallback = EPS t-4 (beräknas i preprocess)
   if (!"CONSENSUS_EPS" %in% names(fundamentals_df)) {
     fundamentals_df$CONSENSUS_EPS <- NA_real_
   }
-  # Dilution = EQY_SH_OUT_t / EQY_SH_OUT_t-1y (beräknas i preprocess)
+  # Vektoriserad och säker coalesce-logik för utdelningar
+  if (!"BEST_DIV_YLD" %in% names(fundamentals_df)) fundamentals_df$BEST_DIV_YLD <- NA_real_
+  if (!"DIVIDEND_YIELD" %in% names(fundamentals_df)) fundamentals_df$DIVIDEND_YIELD <- NA_real_
+  fundamentals_df <- fundamentals_df %>%
+    mutate(Dividend_Yield = dplyr::coalesce(BEST_DIV_YLD, DIVIDEND_YIELD)) %>%
+    select(-BEST_DIV_YLD, -DIVIDEND_YIELD)
+  if ("CUR_MKT_CAP" %in% names(fundamentals_df)) {
+    fundamentals_df <- fundamentals_df %>% rename(Market_Cap = CUR_MKT_CAP)
+  } else {
+    fundamentals_df$Market_Cap <- NA_real_
+  }
   fundamentals_df <- fundamentals_df %>%
     select(report_date, ticker, ACTUAL_EPS, CONSENSUS_EPS, EPS_STD, ROIC,
-           EQY_SH_OUT, Accruals, everything())
+           EQY_SH_OUT, Dividend_Yield, Market_Cap, Accruals, everything())
   write_parquet(fundamentals_df, file.path(OUTPUT_DIR, "fundamentals.parquet"))
   cat(sprintf("Fundamentals: %d rader\n", nrow(fundamentals_df)))
 } else {

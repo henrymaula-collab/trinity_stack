@@ -80,47 +80,76 @@ OVERRIDES <- c(
   CapChgExec = "true"
 )
 
-FIELDS <- c(
-  "PX_OPEN",      # T+1 entry – KRITISKT
-  "PX_LAST",
-  "PX_HIGH",
-  "PX_LOW",
-  "PX_TURN_OVER",
-  "PX_BID",
-  "PX_ASK"
-)
+# Aldrig PX_VOLUME. VWAP_CP = volymviktad kurs — KRITISKT för Layer 6 TCA & slippage;
+# PX_LAST i illikvida småbolag är brusigt/manipulerbart i slutauktion; VWAP ger empiriskt underlag för Market Impact.
+FIELDS <- c("PX_OPEN", "PX_LAST", "PX_HIGH", "PX_LOW", "PX_TURN_OVER", "PX_BID", "PX_ASK", "VWAP_CP")
 
-# ---- 1. Hämta priser (batchad för att undvika Daily Data Limits) ----
-cat(sprintf("Hämtar priser för %d tickers i batchar om %d... (kan ta lång tid)\n", length(TICKERS), BDH_BATCH_SIZE))
-all_prices <- list()
-batches <- split(TICKERS, ceiling(seq_along(TICKERS) / BDH_BATCH_SIZE))
-for (b in seq_along(batches)) {
-  chunk <- batches[[b]]
-  cat(sprintf("  Batch %d/%d: %d tickers\n", b, length(batches), length(chunk)))
-  prices_raw <- bdh(
-    securities = chunk,
-    fields = FIELDS,
-    start.date = START_DATE,
-    end.date = END_DATE,
-    overrides = OVERRIDES,
-    include.non.trading.days = FALSE
-  )
-  if (is.list(prices_raw) && !is.data.frame(prices_raw)) {
-    for (ticker in names(prices_raw)) {
-      df <- as.data.frame(prices_raw[[ticker]])
-      if (!is.null(df) && nrow(df) > 0) {
-        df$ticker <- gsub(" Equity$", "", ticker)
-        all_prices[[length(all_prices) + 1L]] <- df
+# ---- Tracker: Läs status_log, hoppa över Success ----
+STATUS_LOG <- file.path(OUTPUT_DIR, "status_log.csv")
+if (file.exists(STATUS_LOG)) {
+  status_df <- read.csv(STATUS_LOG, stringsAsFactors = FALSE)
+  success_tickers <- status_df$Ticker[status_df$Status == "Success"]
+  TICKERS_PENDING <- setdiff(TICKERS, success_tickers)
+  cat(sprintf("Tracker: %d Success (hoppas över), %d kvar att hämta\n", length(success_tickers), length(TICKERS_PENDING)))
+} else {
+  status_df <- data.frame(Ticker = character(0), Status = character(0), stringsAsFactors = FALSE)
+  TICKERS_PENDING <- TICKERS
+}
+
+# ---- 1. Hämta priser (iterativ batching, checkpoint, robust felhantering) ----
+all_batch_paths <- character(0)
+if (length(TICKERS_PENDING) > 0) {
+  batches <- split(TICKERS_PENDING, ceiling(seq_along(TICKERS_PENDING) / BDH_BATCH_SIZE))
+  for (b in seq_along(batches)) {
+    chunk <- batches[[b]]
+    cat(sprintf("  Batch %d/%d: %d tickers\n", b, length(batches), length(chunk)))
+    batch_data <- list()
+    for (ticker in chunk) {
+      res <- tryCatch({
+        raw <- bdh(
+          securities = ticker,
+          fields = FIELDS,
+          start.date = START_DATE,
+          end.date = END_DATE,
+          overrides = OVERRIDES,
+          include.non.trading.days = FALSE
+        )
+        df <- if (is.data.frame(raw)) raw else as.data.frame(raw[[1]])
+        if (is.null(df) || nrow(df) == 0) {
+          list(status = "Failed", data = NULL)
+        } else {
+          df$ticker <- gsub(" Equity$", "", ticker)
+          list(status = "Success", data = df)
+        }
+      }, error = function(e) {
+        list(status = "Failed", data = NULL)
+      })
+      idx <- which(status_df$Ticker == ticker)
+      if (length(idx) > 0) {
+        status_df$Status[idx] <- res$status
+      } else {
+        status_df <- rbind(status_df, data.frame(Ticker = ticker, Status = res$status, stringsAsFactors = FALSE))
       }
+      if (!is.null(res$data)) batch_data[[length(batch_data) + 1L]] <- res$data
     }
-  } else if (is.data.frame(prices_raw) && nrow(prices_raw) > 0) {
-    prices_raw$ticker <- gsub(" Equity$", "", chunk[1])
-    all_prices[[length(all_prices) + 1L]] <- prices_raw
+    if (length(batch_data) > 0) {
+      batch_df <- bind_rows(batch_data)
+      batch_path <- file.path(OUTPUT_DIR, sprintf("prices_batch_%d.parquet", b))
+      write_parquet(batch_df, batch_path)
+      all_batch_paths <- c(all_batch_paths, batch_path)
+    }
+    write.csv(status_df, STATUS_LOG, row.names = FALSE)
   }
 }
-if (length(all_prices) == 0) stop("Inga prismatalogar hämtade.", call. = FALSE)
-prices_df <- bind_rows(all_prices)
-if (!"ticker" %in% names(prices_df)) prices_df$ticker <- gsub(" Equity$", "", TICKERS[1])
+
+# Slå ihop alla batchar + eventuella tidigare batchfiler
+batch_files <- list.files(OUTPUT_DIR, pattern = "^prices_batch_.*\\.parquet$", full.names = TRUE)
+if (length(batch_files) > 0) {
+  prices_df <- bind_rows(lapply(batch_files, read_parquet))
+} else {
+  stop("Inga prismatalogar (batchar) tillgängliga.", call. = FALSE)
+}
+if (!"ticker" %in% names(prices_df)) prices_df$ticker <- character(0)
 
 # Ticker rensat direkt — undvik join-fel mot fundamentals
 SEK_TICKERS_CLEAN <- gsub(" Equity$", "", SEK_TICKERS)
@@ -156,7 +185,7 @@ prices_df <- prices_df %>% left_join(
   fx_df %>% rename(sekeur_rate = sekeur),
   by = "date"
 )
-price_cols <- c("PX_OPEN", "PX_LAST", "PX_HIGH", "PX_LOW", "PX_TURN_OVER", "PX_BID", "PX_ASK")
+price_cols <- c("PX_OPEN", "PX_LAST", "PX_HIGH", "PX_LOW", "PX_TURN_OVER", "PX_BID", "PX_ASK", "VWAP_CP")
 for (col in price_cols) {
   if (col %in% names(prices_df)) {
     prices_df[[col]] <- as.numeric(prices_df[[col]])
@@ -180,7 +209,7 @@ prices_df$PX_MID <- NULL
 
 # ---- 5. Output-kolumner för Trinity ----
 out_cols <- c("date", "ticker", "PX_OPEN", "PX_LAST", "PX_HIGH", "PX_LOW",
-              "PX_TURN_OVER", "BID_ASK_SPREAD_PCT")
+              "PX_TURN_OVER", "BID_ASK_SPREAD_PCT", "VWAP_CP")
 out_cols <- out_cols[out_cols %in% names(prices_df)]
 prices_out <- prices_df[, out_cols]
 

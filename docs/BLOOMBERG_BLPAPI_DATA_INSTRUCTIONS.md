@@ -48,6 +48,7 @@ pip install pdblp   # eller: pip install blpapi (officiell SDK)
 | PX_HIGH              | `PX_HIGH`          | För dags-volatilitet och fill-sannolikhetsmodell |
 | PX_LOW               | `PX_LOW`           | För dags-volatilitet |
 | PX_TURN_OVER         | `PX_TURN_OVER`     | **Daglig omsättning i valuta** (inte antal aktier). Amihud + Capacity + Participation Cap. |
+| VWAP_CP              | `VWAP_CP`          | **KRITISKT för Layer 6 TCA.** Volymviktad kurs — referenspris för slippage och Market Impact. PX_LAST i illikvida småbolag är brusigt/manipulerbart i slutauktioner. |
 | BID_ASK_SPREAD_PCT   | Beräkna            | `(PX_ASK - PX_BID) / PX_MID * 100` (eller `(PX_ASK + PX_BID)/2`) |
 
 **Bloomberg Fields att hämta:**
@@ -60,6 +61,7 @@ fields = [
     "PX_TURN_OVER",  # För Amihud & Capacity
     "PX_BID",        # För spread-beräkning
     "PX_ASK",        # För spread-beräkning
+    "VWAP_CP",       # Volymviktad kurs — Layer 6 TCA, slippage, Market Impact
 ]
 ```
 
@@ -148,6 +150,7 @@ con.stop()
 | EPS_STD          | `BEST_EPS_EST_STD_DEV`                      | Se fallback nedan                 |
 | ROIC             | `RETURN_ON_INVESTED_CAPITAL`                | ROIC                              |
 | Dilution         | `EQY_SH_OUT` (uteslående aktier)            | Se optimering nedan               |
+| Dividend_Yield   | `BEST_DIV_YLD` (estimat) + `DIVIDEND_YIELD` (historisk) | **Båda krävs.** `coalesce(BEST_DIV_YLD, DIVIDEND_YIELD)` — nordiska småbolag saknar ofta analytikertäckning; endast BEST_DIV_YLD ger gles träningsmatris. |
 | Accruals         | `ACCRUAL_RATIO` eller (NI - CFO) / TA       | Beräkna från fundamentals         |
 
 ### Fallback för SUE (nordiska småbolag saknar analytikertäckning)

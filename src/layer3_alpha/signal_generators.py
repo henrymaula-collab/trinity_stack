@@ -24,6 +24,7 @@ LGBM_FEATURE_CANDIDATES: List[str] = [
     "Vol_Compression",
     "is_january_prep",
     "dist_to_sma200",
+    "Dividend_Yield",  # Direktavkastning; kvalitets-/värdefaktor
 ]
 
 

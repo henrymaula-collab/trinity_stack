@@ -36,6 +36,7 @@ LAYER3_OUTPUT_COLS: List[str] = [
     "is_january_prep",
     "dist_to_sma200",
     "Local_Rate",
+    "Dividend_Yield",
     "forward_return",
 ]
 
@@ -206,21 +207,15 @@ class FeatureEngineer:
         else:
             merged["Local_Rate"] = np.nan
 
-        out = merged[
-            [
-                "date",
-                "ticker",
-                "Quality_Score",
-                "BID_ASK_SPREAD_PCT",
-                "PX_TURN_OVER",
-                "SUE",
-                "Amihud",
-                "Vol_Compression",
-                "is_january_prep",
-                "dist_to_sma200",
-                "Local_Rate",
-                "forward_return",
-            ]
-        ].copy()
+        # Dividend_Yield: produceras av data2 (coalesce i R). Validera; saknas den, lägg till NaN.
+        if "Dividend_Yield" not in merged.columns:
+            merged["Dividend_Yield"] = np.nan
+
+        out_cols = [
+            "date", "ticker", "Quality_Score", "BID_ASK_SPREAD_PCT", "PX_TURN_OVER",
+            "SUE", "Amihud", "Vol_Compression", "is_january_prep", "dist_to_sma200",
+            "Local_Rate", "Dividend_Yield", "forward_return",
+        ]
+        out = merged[[c for c in out_cols if c in merged.columns]].copy()
 
         return out.dropna(subset=["forward_return"]).reset_index(drop=True)
