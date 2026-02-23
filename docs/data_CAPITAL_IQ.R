@@ -61,7 +61,7 @@ debt_wall_schema <- function(df) {
     select(date, ticker, market_cap, cash_equivalents, ttm_fcf, next_12m_debt_maturity) %>%
     mutate(
       date = as.Date(date),
-      across(c(market_cap, cash_equivalents, ttm_fcf, next_12m_debt_maturity), as.numeric)
+      across(any_of(c("market_cap", "cash_equivalents", "ttm_fcf", "next_12m_debt_maturity")), as.numeric)
     )
 }
 

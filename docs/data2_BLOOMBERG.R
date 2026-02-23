@@ -4,7 +4,8 @@
 # Kör efter data1. Lättare datamängder — kvotvänlig.
 # Output: fundamentals.parquet, macro.parquet, news.parquet (om tillgänglig)
 #
-# Krav: Bloomberg Terminal igång, data1 redan körd (för samma tickers)
+# Krav: Bloomberg Terminal igång; TICKERS från data1 (nordic_historical_universe.csv)
+#       eller PiT-universum via get_historical_universe
 # =============================================================================
 
 library(Rblpapi)
@@ -16,22 +17,27 @@ library(tidyr)
 OUTPUT_DIR <- "data/raw"  # Samma som data1
 START_DATE <- as.Date("2006-01-01")
 END_DATE <- as.Date("2026-12-31")
+FUND_BATCH_SIZE <- 50L
+UNIVERSE_CACHE <- file.path(OUTPUT_DIR, "nordic_historical_universe.csv")
 
-TICKERS <- c(
-  "NOKIA FH Equity", "UPM FH Equity", "ORNBV FH Equity",
-  "VOLV-B SS Equity", "ERIC-B SS Equity", "ATCO-A SS Equity"
-)
+# Läs TICKERS från data1s cache (kör data1 först) eller fallback till manuell lista
+if (file.exists(UNIVERSE_CACHE)) {
+  TICKERS <- read.csv(UNIVERSE_CACHE, stringsAsFactors = FALSE)$ticker
+  cat(sprintf("Universum från data1: %d tickers\n", length(TICKERS)))
+} else {
+  TICKERS <- c("NOKIA FH Equity", "UPM FH Equity", "ORNBV FH Equity",
+               "VOLV-B SS Equity", "ERIC-B SS Equity", "ATCO-A SS Equity")
+  cat("Varning: nordic_historical_universe.csv saknas. Kör data1 först. Använder fallback-lista.\n")
+}
 
 # ---- Anslut Bloomberg ----
 blpConnect(host = "localhost", port = 8194L)
 
 # =============================================================================
-# 1. FUNDAMENTALS (reference/snapshot data)
+# 1. FUNDAMENTALS (batchad för stort universum)
 # =============================================================================
 cat("Hämtar fundamentals...\n")
 
-# bdib/bulk kan behövas för fundamentals – bdh med BEST-fält
-# Referensdata per rapportdatum
 fund_fields <- c(
   "EARN_ANN_DT_TIME_HIST_WITH_EPS",
   "BEST_EPS",
@@ -40,19 +46,21 @@ fund_fields <- c(
   "EQY_SH_OUT",
   "ACCRUAL_RATIO"
 )
-
-# bds för bulk/periodic – eller bdh med periodicity
-# Fallback: bdh per ticker med quarterly
 opt <- c(periodicitySelection = "QUARTERLY")
 fund_list <- list()
-for (ticker in TICKERS) {
-  tryCatch({
-    df <- bdh(ticker, fund_fields, START_DATE, END_DATE, options = opt)
-    if (!is.null(df) && nrow(df) > 0) {
-      df$ticker <- gsub(" Equity$", "", ticker)
-      fund_list[[ticker]] <- df
-    }
-  }, error = function(e) cat("Fel för", ticker, ":", conditionMessage(e), "\n"))
+batches <- split(TICKERS, ceiling(seq_along(TICKERS) / FUND_BATCH_SIZE))
+for (b in seq_along(batches)) {
+  chunk <- batches[[b]]
+  cat(sprintf("  Fundamentals batch %d/%d: %d tickers\n", b, length(batches), length(chunk)))
+  for (ticker in chunk) {
+    tryCatch({
+      df <- bdh(ticker, fund_fields, START_DATE, END_DATE, options = opt)
+      if (!is.null(df) && nrow(df) > 0) {
+        df$ticker <- gsub(" Equity$", "", ticker)
+        fund_list[[ticker]] <- df
+      }
+    }, error = function(e) invisible(NULL))
+  }
 }
 fund_list_valid <- fund_list[!sapply(fund_list, is.null)]
 if (length(fund_list_valid) == 0) {

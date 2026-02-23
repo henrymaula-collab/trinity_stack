@@ -2,7 +2,7 @@
 # Trinity Stack — Bloomberg DATA 1: PRICES + FX
 # =============================================================================
 # Kör först. Största datamängden — hålls separat för att undvika kvot.
-# Output: prices.parquet, fx_sekeur.parquet
+# Output: prices.parquet, fx_sekeur.parquet, nordic_historical_universe.csv
 #
 # Krav: Bloomberg Terminal igång, Rblpapi installerat
 # install.packages("Rblpapi")
@@ -17,14 +17,58 @@ library(tidyr)
 OUTPUT_DIR <- "data/raw"  # Ändra till din Trinity Stack-sökväg
 START_DATE <- as.Date("2006-01-01")
 END_DATE <- as.Date("2026-12-31")
+BDH_BATCH_SIZE <- 50L  # Undvik Daily Data Limits vid stort universum
+UNIVERSE_CACHE <- file.path(OUTPUT_DIR, "nordic_historical_universe.csv")
+USE_CACHED_UNIVERSE <- TRUE  # FALSE = hämta nytt PiT-universum från Bloomberg
 
-# Point-in-time universum (ändra till dina tickers)
-# Exempel: OMX Helsinki + Stockholm. Använd INDX_MWEIGHT med END_DATE_OVERRIDE
-# eller manuell lista + dead_tickers.csv för survivorship bias-frihet
-TICKERS <- c(
-  "NOKIA FH Equity", "UPM FH Equity", "ORNBV FH Equity",  # Helsinki
-  "VOLV-B SS Equity", "ERIC-B SS Equity", "ATCO-A SS Equity"  # Stockholm
-)
+# ---- Dynamiskt Point-in-Time Universum (eliminerar survivorship bias) ----
+# Kvartalsvis sampling: fångar bolag som tillkommer/avlistas inom året
+get_historical_universe <- function(indices, start_year, end_year) {
+  all_tickers <- character(0)
+  quarter_dates <- c("0331", "0630", "0930", "1231")  # Kvartalsvis
+  for (idx in indices) {
+    for (year in start_year:end_year) {
+      for (q in quarter_dates) {
+        date_str <- paste0(sprintf("%04d", year), q)
+        tryCatch({
+          members <- bds(idx, "INDX_MWEIGHT", overrides = c(END_DATE_OVERRIDE = date_str))
+          if (!is.null(members) && nrow(members) > 0) {
+            col_member <- names(members)[1]
+            raw <- as.character(members[[col_member]])
+            raw <- raw[!is.na(raw) & nchar(trimws(raw)) > 0]
+            # Respektera befintlig börskod (FH/SS): endast lägg till " Equity" i slutet
+            tickers <- ifelse(grepl(" Equity$", raw), raw, paste(trimws(raw), "Equity"))
+            all_tickers <- c(all_tickers, tickers)
+          }
+        }, error = function(e) {
+          warning(sprintf("Kunde inte hämta %s för %s: %s", idx, date_str, conditionMessage(e)))
+        })
+      }
+    }
+  }
+  unique(all_tickers)
+}
+
+# ---- Anslut Bloomberg (krävs för PiT-universum) ----
+blpConnect(host = "localhost", port = 8194L)
+
+# Läs eller generera universum
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+if (USE_CACHED_UNIVERSE && file.exists(UNIVERSE_CACHE)) {
+  TICKERS <- read.csv(UNIVERSE_CACHE, stringsAsFactors = FALSE)$ticker
+  cat(sprintf("Universum från cache: %d tickers (%s)\n", length(TICKERS), UNIVERSE_CACHE))
+} else {
+  target_indices <- c("OMXSSC Index", "OMXHSC Index")  # Stockholm & Helsinki Small Cap
+  TICKERS <- get_historical_universe(target_indices, 2006, 2026)
+  if (length(TICKERS) == 0) {
+    warning("PiT-universum tomt. Fallback till manuell lista.")
+    TICKERS <- c("NOKIA FH Equity", "UPM FH Equity", "ORNBV FH Equity",
+                 "VOLV-B SS Equity", "ERIC-B SS Equity", "ATCO-A SS Equity")
+  } else {
+    write.csv(data.frame(ticker = TICKERS), UNIVERSE_CACHE, row.names = FALSE)
+    cat(sprintf("PiT-universum sparad: %d unika tickers\n", length(TICKERS)))
+  }
+}
 
 # Stockholm-tickers för FX-konvertering (suffix SS)
 SEK_TICKERS <- TICKERS[grepl(" SS ", TICKERS)]
@@ -46,37 +90,37 @@ FIELDS <- c(
   "PX_ASK"
 )
 
-# ---- Anslut Bloomberg ----
-blpConnect(host = "localhost", port = 8194L)
-
-# ---- 1. Hämta priser ----
-cat("Hämtar priser... (kan ta flera minuter)\n")
-prices_raw <- bdh(
-  securities = TICKERS,
-  fields = FIELDS,
-  start.date = START_DATE,
-  end.date = END_DATE,
-  overrides = OVERRIDES,
-  include.non.trading.days = FALSE
-)
-
-# Konvertera till long format – Rblpapi returnerar list per security
-if (is.list(prices_raw) && !is.data.frame(prices_raw)) {
-  prices_list <- lapply(names(prices_raw), function(ticker) {
-    df <- as.data.frame(prices_raw[[ticker]])
-    if (is.null(df) || nrow(df) == 0) return(NULL)
-    df$ticker <- gsub(" Equity$", "", ticker)
-    df
-  })
-  prices_df <- bind_rows(prices_list[!sapply(prices_list, is.null)])
-} else {
-  prices_df <- as.data.frame(prices_raw)
-  if (!"ticker" %in% names(prices_df)) {
-    prices_df$ticker <- gsub(" Equity$", "", TICKERS[1])
-  } else {
-    prices_df$ticker <- gsub(" Equity$", "", prices_df$ticker)
+# ---- 1. Hämta priser (batchad för att undvika Daily Data Limits) ----
+cat(sprintf("Hämtar priser för %d tickers i batchar om %d... (kan ta lång tid)\n", length(TICKERS), BDH_BATCH_SIZE))
+all_prices <- list()
+batches <- split(TICKERS, ceiling(seq_along(TICKERS) / BDH_BATCH_SIZE))
+for (b in seq_along(batches)) {
+  chunk <- batches[[b]]
+  cat(sprintf("  Batch %d/%d: %d tickers\n", b, length(batches), length(chunk)))
+  prices_raw <- bdh(
+    securities = chunk,
+    fields = FIELDS,
+    start.date = START_DATE,
+    end.date = END_DATE,
+    overrides = OVERRIDES,
+    include.non.trading.days = FALSE
+  )
+  if (is.list(prices_raw) && !is.data.frame(prices_raw)) {
+    for (ticker in names(prices_raw)) {
+      df <- as.data.frame(prices_raw[[ticker]])
+      if (!is.null(df) && nrow(df) > 0) {
+        df$ticker <- gsub(" Equity$", "", ticker)
+        all_prices[[length(all_prices) + 1L]] <- df
+      }
+    }
+  } else if (is.data.frame(prices_raw) && nrow(prices_raw) > 0) {
+    prices_raw$ticker <- gsub(" Equity$", "", chunk[1])
+    all_prices[[length(all_prices) + 1L]] <- prices_raw
   }
 }
+if (length(all_prices) == 0) stop("Inga prismatalogar hämtade.", call. = FALSE)
+prices_df <- bind_rows(all_prices)
+if (!"ticker" %in% names(prices_df)) prices_df$ticker <- gsub(" Equity$", "", TICKERS[1])
 
 # Ticker rensat direkt — undvik join-fel mot fundamentals
 SEK_TICKERS_CLEAN <- gsub(" Equity$", "", SEK_TICKERS)

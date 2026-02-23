@@ -252,7 +252,7 @@ def run_pipeline() -> None:
     signal_mom = momentum_gen.generate(raw_prices)
     print(f"  signal_mom: {len(signal_mom)} values")
 
-    print("  LightGBMGenerator.train_walk_forward()...")
+    print("  LightGBMGenerator.train_walk_forward() [purge_days=5]...")
     feat_for_lgbm = features_df.copy()
     lgbm_gen.train_walk_forward(feat_for_lgbm, target_col="forward_return")
 

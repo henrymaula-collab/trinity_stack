@@ -91,10 +91,14 @@ class MomentumGenerator:
         return out
 
 
+PURGE_DAYS_DEFAULT = 5
+FORWARD_RETURN_HORIZON_DEFAULT = 1  # Layer 1 uses shift(-1) = 1-day forward
+
+
 class LightGBMGenerator:
     """
     LightGBM regressor for forward return prediction.
-    Expanding window walk-forward training; strictly no look-ahead.
+    Expanding window walk-forward; purge_days must be >= forward_return_horizon.
     """
 
     def __init__(
@@ -103,7 +107,20 @@ class LightGBMGenerator:
         n_estimators: int = 100,
         max_depth: int = 5,
         learning_rate: float = 0.1,
+        forward_return_horizon: int = FORWARD_RETURN_HORIZON_DEFAULT,
+        purge_days: Optional[int] = None,
     ) -> None:
+        self.forward_return_horizon = forward_return_horizon
+        self.purge_days = (
+            purge_days
+            if purge_days is not None
+            else max(forward_return_horizon, PURGE_DAYS_DEFAULT)
+        )
+        if self.purge_days < forward_return_horizon:
+            raise ValueError(
+                f"purge_days ({self.purge_days}) must be >= forward_return_horizon ({forward_return_horizon}) "
+                "to prevent target overlap with test period"
+            )
         self.random_state = random_state
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -126,8 +143,9 @@ class LightGBMGenerator:
         target_col: str = "forward_return",
     ) -> None:
         """
-        Expanding window walk-forward: for each date T, train on data with date < T.
-        Models stored for use in predict(). No look-ahead.
+        Expanding window walk-forward with purge period.
+        For each pred_date: train on data with date < (pred_date - purge_days).
+        Karantänperioden eliminerar läckage från rapporteringsfördröjningar.
         """
         try:
             import lightgbm as lgb
@@ -147,9 +165,11 @@ class LightGBMGenerator:
         dates = sorted(df["date"].unique())
 
         self._models_by_date.clear()
+        cutoff_delta = pd.offsets.BDay(self.purge_days)
 
         for i, pred_date in enumerate(dates):
-            train_mask = df["date"] < pred_date
+            train_cutoff = pd.Timestamp(pred_date) - cutoff_delta
+            train_mask = df["date"] < train_cutoff
             train_df = df.loc[train_mask]
             if len(train_df) < 10:
                 continue

@@ -71,7 +71,9 @@ Ingen layer får importera logik från en annan layer; endast output (DataFrame/
 
 **Hard Filters:** Kasta lägsta Quality Score-kvartilen, spread > 3 %, otillräcklig volym.
 
-**Ensemble:** Momentum + LightGBM med IC-stabilitetsviktning. Model weight = IC / std(IC), begränsad till [0.3, 0.7]. Modellen tränas uteslutande via en strictly out-of-sample 'Expanding Walk-Forward Cross-Validation' för att förhindra look-ahead bias och data-läckage mellan tränings- och test-set.
+**Ensemble:** Momentum + LightGBM med IC-stabilitetsviktning. Model weight = IC / std(IC), begränsad till [0.3, 0.7]. Modellen tränas via Expanding Walk-Forward med karantänperiod. **Regel:** purge_days måste vara ≥ forward_return_horizon (1-dag default). Vid 21-dagars target krävs purge_days ≥ 21. Default: max(1, 5) = 5 för 1-dagars forward_return.
+
+**ExpandingWalkForwardCV** (`src/layer3_alpha/expanding_walk_forward_cv.py`): Klass för att generera (train_idx, test_idx)-splits. Används av LightGBMGenerator internt; kan användas för hyperparameteroptimering (grid/random search över folds).
 
 **Soft Decay Hysteresis:** Sell-threshold startar högt på T+1 och fasar ut linjärt över 60 dagar (ingen framtidsrank).
 

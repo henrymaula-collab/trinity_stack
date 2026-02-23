@@ -83,10 +83,7 @@ overrides = [
 
 **Fel:** Att hämta `INDEX_MEMBERS` idag ger endast bolag som överlevt fram till 2026. Konkurser, uppköp och avlistningar sedan 2006 saknas → ML-modellen tränas på ett universum med statistiskt noll konkursris.
 
-**Korrektion:** Hämta historiska indexmedlemmar per månad/kvartal.
-
-- **Bloomberg:** `INDX_MWEIGHT` med `END_DATE_OVERRIDE` för varje månad, eller BQL (Bloomberg Query Language) för point-in-time universum.
-- **Alternativ:** Manuell `dead_tickers.csv` med avlistade bolag (t.ex. från tidigare Portman-projekt) och slå ihop med aktuella constituents per tidsperiod.
+**Implementerat i R-skripten:** `get_historical_universe()` använder `bds(..., INDX_MWEIGHT)` med **kvartalsvis** END_DATE_OVERRIDE (0331, 0630, 0930, 1231) för varje år 2006–2026. Fångar intra-år till-/avlistningar. Ticker-normalisering: använder Bloombergs "Member Ticker and Exchange Code" (FH/SS) oförändrad, lägger endast till " Equity". Batchad bdh (50 tickers/request) undviker Daily Data Limits.
 
 ### KRITISKT: Valuta-normalisering (FX – SEK → EUR)
 
