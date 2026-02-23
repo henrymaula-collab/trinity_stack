@@ -96,9 +96,9 @@ def _build_aggressive_regime_df(
     v2tx_sma = v2tx.rolling(window=sma_window, min_periods=21).mean().shift(1)
     trend_broken = (v2tx > v2tx_sma).reindex(dates).fillna(False)
 
-    # Either condition -> regime 2 (full cut)
+    # Either condition -> regime_exposure 0.0 (full cut)
     cut = spread_stress | trend_broken
-    out.loc[cut, "regime"] = 2
+    out.loc[cut, "regime"] = 0.0
     return out
 
 

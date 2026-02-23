@@ -1,18 +1,19 @@
 """
 Backtest engine orchestrating Layers 2-5 over rebalance dates.
 Strict point-in-time semantics; fail-fast on missing data or index mismatch.
+Supports Pessimistic Execution Engine: T+1 realism, friction and opportunity cost metrics.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
 import pandas as pd
 
 TRAILING_DAYS: int = 252
 ROLLING_VOL_DAYS: int = 1260  # 5 years
-CRISIS_REGIME: int = 2
+CRISIS_EXPOSURE_THRESHOLD: float = 0.01  # regime_exposure < this => full exit
 TRADING_DAYS_YEAR: int = 252
 
 
@@ -29,7 +30,7 @@ class _VolTargetProtocol(Protocol):
         hrp_weights: pd.Series,
         cov_matrix: pd.DataFrame,
         nlp_multipliers: pd.Series,
-        macro_regime: int,
+        regime_exposure: float,
         historical_volatilities: pd.Series,
         portfolio_drawdown: float = 0.0,
         target_vol_annual: float | None = None,
@@ -72,14 +73,19 @@ class BacktestEngine:
         news_df: pd.DataFrame,
         rebalance_dates: List[pd.Timestamp],
         currency_series: Optional[pd.Series] = None,
-    ) -> pd.DataFrame:
+        adv_series: Optional[pd.DataFrame] = None,
+        portfolio_aum: Optional[float] = None,
+        raw_prices: Optional[pd.DataFrame] = None,
+        macro_raw_df: Optional[pd.DataFrame] = None,
+        use_pessimistic_execution: bool = False,
+    ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, Dict[str, float]]]:
         """
         Iterate through rebalance_dates, run Layers 2-5, return concatenated weights.
 
         Args:
             price_df: Daily returns, index=date, columns=ticker.
             alpha_df: Alpha signals with columns [date, ticker, alpha_score, ...].
-            macro_df: Regime time series, index=date, column 'regime' (0/1/2).
+            macro_df: Regime time series, index=date, column 'regime' (float 0.0–1.0).
             news_df: News with columns [ticker, date, text].
             rebalance_dates: List of rebalance dates.
             currency_series: Ticker -> 'EUR' or 'SEK'. If None, mock (alternating by ticker).
@@ -111,9 +117,9 @@ class BacktestEngine:
                 if peak_equity > 0:
                     portfolio_drawdown = (cum_equity - peak_equity) / peak_equity
 
-            # Layer 2: Macro regime
-            macro_regime = self._get_regime_asof(macro_df, rb_date)
-            if macro_regime == CRISIS_REGIME:
+            # Layer 2: Macro regime (continuous exposure)
+            regime_exposure = self._get_regime_asof(macro_df, rb_date)
+            if regime_exposure < CRISIS_EXPOSURE_THRESHOLD:
                 tickers = self._extract_tickers(alpha_df, rb_date)
                 prev_weights = {t: 0.0 for t in tickers}
                 last_rb_date = rb_date
@@ -147,17 +153,24 @@ class BacktestEngine:
                 news_df, final_tickers, rb_date
             )
 
-            # Layer 5: HRP + vol target
+            # Layer 5: HRP + vol target + capacity penalty
             cov_matrix = returns_trailing.cov()
             hrp_weights = self._hrp_model.allocate(returns_trailing, currency)
             hist_vols = self._rolling_vol(price_df, rb_date, final_tickers)
+            adv = None
+            if adv_series is not None and not adv_series.empty:
+                asof = adv_series[adv_series.index < rb_date]
+                if not asof.empty:
+                    adv = asof.iloc[-1].reindex(final_tickers)
             final_weights = self._vol_targeter.apply_targets(
                 hrp_weights,
                 cov_matrix,
                 nlp_multipliers,
-                macro_regime,
+                regime_exposure,
                 historical_volatilities=hist_vols,
                 portfolio_drawdown=portfolio_drawdown,
+                adv_series=adv,
+                portfolio_aum=portfolio_aum,
             )
 
             prev_weights = dict(final_weights)
@@ -166,9 +179,33 @@ class BacktestEngine:
                 records.append({"date": rb_date, "ticker": ticker, "target_weight": float(w)})
 
         if not records:
-            return pd.DataFrame(columns=["date", "ticker", "target_weight"])
+            weights_df = pd.DataFrame(columns=["date", "ticker", "target_weight"])
+            if use_pessimistic_execution and raw_prices is not None:
+                self._last_pessimistic_metrics = {"Total_Friction_Cost_BPS": 0.0, "Opportunity_Cost_BPS": 0.0}
+                return weights_df, self._last_pessimistic_metrics
+            return weights_df
 
-        return pd.DataFrame(records)
+        weights_df = pd.DataFrame(records)
+        if use_pessimistic_execution and raw_prices is not None:
+            from src.layer6_execution.pessimistic_execution import compute_friction_and_opportunity_cost
+
+            adv_for_sim = adv_series if adv_series is not None and not adv_series.empty else pd.DataFrame()
+            if adv_for_sim.empty and "PX_TURN_OVER" in raw_prices.columns:
+                px = raw_prices.pivot_table(index="date", columns="ticker", values="PX_TURN_OVER")
+                adv_for_sim = px.rolling(20, min_periods=1).mean()
+            _, metrics = compute_friction_and_opportunity_cost(
+                weights_df,
+                raw_prices,
+                price_df,
+                alpha_df,
+                macro_df,
+                macro_raw_df,
+                adv_for_sim,
+                portfolio_aum=portfolio_aum or 1e6,
+            )
+            self._last_pessimistic_metrics = metrics
+            return weights_df, metrics
+        return weights_df
 
     def _validate_inputs(
         self,
@@ -191,13 +228,13 @@ class BacktestEngine:
         if not rebalance_dates:
             raise ValueError("rebalance_dates must be non-empty")
 
-    def _get_regime_asof(self, macro_df: pd.DataFrame, rb_date: pd.Timestamp) -> int:
+    def _get_regime_asof(self, macro_df: pd.DataFrame, rb_date: pd.Timestamp) -> float:
         asof = macro_df.loc[macro_df.index < rb_date]
         if asof.empty:
             raise ValueError(f"No macro regime data before {rb_date}")
-        regime = int(asof["regime"].iloc[-1])
-        if regime not in (0, 1, 2):
-            raise ValueError(f"Invalid regime {regime}; must be 0, 1, or 2")
+        regime = float(asof["regime"].iloc[-1])
+        if not (0.0 <= regime <= 1.0):
+            raise ValueError(f"Invalid regime_exposure {regime}; must be in [0, 1]")
         return regime
 
     def _extract_tickers(self, alpha_df: pd.DataFrame, rb_date: pd.Timestamp) -> List[str]:

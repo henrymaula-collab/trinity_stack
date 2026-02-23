@@ -30,8 +30,8 @@ Layer 6: Execution & TCA         → Orders + SQLite logging
 | **L2** | Macro HMM + Liquidity overlay | Regime state (multi-state), liquidity stress indicator |
 | **L3** | Momentum + LightGBM + IC ensemble | Alpha scores (ranked) |
 | **L4** | NLP Sentinel | Risk multipliers (negative event penalties) |
-| **L5** | HRP + dynamic vol target | Target weights |
-| **L6** | Execution engine + TCA | Limit orders, stop-loss, SQLite logs |
+| **L5** | HRP + dynamic vol target + capacity penalty | Target weights |
+| **L6** | Execution engine + TCA + fill-probability model | Limit orders, SQLite logs |
 
 ---
 
@@ -45,9 +45,9 @@ Layer 6: Execution & TCA         → Orders + SQLite logging
 
 **Layer 4** — Transformer-based sentiment on corporate actions; penalty for extreme negative events with exponential recovery decay.
 
-**Layer 5** — Currency-isolated HRP; inverse volatility intra-cluster; dynamic vol target; drawdown overlay.
+**Layer 5** — Currency-isolated HRP; inverse volatility intra-cluster; dynamic vol target; drawdown overlay; capacity penalty.
 
-**Layer 6** — Conviction-scaled limit pricing; Expected Shortfall stop-loss; TCA logging.
+**Layer 6** — Conviction-scaled limit pricing; TCA logging with fill-calibration; FillProbabilityModel. No mechanical market stop-losses.
 
 ---
 

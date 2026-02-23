@@ -35,6 +35,7 @@ LAYER3_OUTPUT_COLS: List[str] = [
     "Vol_Compression",
     "is_january_prep",
     "dist_to_sma200",
+    "Local_Rate",
     "forward_return",
 ]
 
@@ -107,9 +108,11 @@ class FeatureEngineer:
         self,
         raw_price_df: pd.DataFrame,
         raw_fundamentals_df: pd.DataFrame,
+        macro_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """
         Merge price + lagged fundamentals, compute features.
+        If macro_df provided: maps Rates_FI/Rates_SE to Local_Rate per ticker (FH→FI, SS→SE).
         Output: Layer 3 required columns.
         """
         for col in PRICE_REQUIRED:
@@ -175,6 +178,34 @@ class FeatureEngineer:
             calculate_vol_compression
         )
 
+        # Local_Rate: explicit mappning per hemvist — SS→Rates_SE, FH→Rates_FI; övriga→NaN (fail-fast)
+        if macro_df is not None and "Rates_FI" in macro_df.columns and "Rates_SE" in macro_df.columns:
+            macro = macro_df.copy()
+            if "date" not in macro.columns:
+                macro = macro.reset_index()
+                if "index" in macro.columns:
+                    macro = macro.rename(columns={"index": "date"})
+            macro["date"] = pd.to_datetime(macro["date"])
+            macro_sorted = macro[["date", "Rates_FI", "Rates_SE"]].sort_values("date").reset_index(drop=True)
+            merged_sorted = merged.sort_values("date").reset_index(drop=True)
+            merged = pd.merge_asof(
+                merged_sorted,
+                macro_sorted,
+                on="date",
+                direction="backward",
+            )
+            ticker_str = merged["ticker"].astype(str)
+            is_ss = ticker_str.str.endswith(" SS", na=False)
+            is_fh = ticker_str.str.endswith(" FH", na=False)
+            merged["Local_Rate"] = np.select(
+                [is_ss, is_fh],
+                [merged["Rates_SE"], merged["Rates_FI"]],
+                default=np.nan,
+            )
+            merged = merged.drop(columns=["Rates_FI", "Rates_SE"], errors="ignore")
+        else:
+            merged["Local_Rate"] = np.nan
+
         out = merged[
             [
                 "date",
@@ -187,6 +218,7 @@ class FeatureEngineer:
                 "Vol_Compression",
                 "is_january_prep",
                 "dist_to_sma200",
+                "Local_Rate",
                 "forward_return",
             ]
         ].copy()

@@ -24,17 +24,17 @@ class MockVolTarget:
         hrp_weights,
         cov_matrix,
         nlp_multipliers,
-        macro_regime,
+        regime_exposure,
         historical_volatilities,
         portfolio_drawdown=0.0,
         target_vol_annual=None,
+        adv_series=None,
+        portfolio_aum=None,
+        **kwargs,
     ):
         w = hrp_weights * nlp_multipliers
         w = w / w.sum()
-        if macro_regime == 1:
-            w = w * 0.5
-        elif macro_regime == 2:
-            w = w * 0.0
+        w = w * regime_exposure
         return w
 
 def run_tests():
@@ -53,9 +53,9 @@ def run_tests():
         "alpha_score": [0.8, 0.9, 0.7, 0.6]
     })
     
-    # 3. Macro Data
+    # 3. Macro Data (continuous regime exposure: 1.0=Bull, 0.5=Neutral, 0.0=Crisis)
     macro_df = pd.DataFrame({
-        "regime": [0, 0, 0, 0, 0, 0, 1, 1, 2, 2] # Går från Bull (0) -> Neutral (1) -> Crisis (2)
+        "regime": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.0, 0.0]
     }, index=dates)
     
     # 4. News Data
@@ -82,7 +82,7 @@ def run_tests():
     date1_res = res[res["date"] == dates[5]]
     assert np.isclose(date1_res["target_weight"].sum(), 1.0), "❌ FEL: Vikterna summerar inte till 1.0 i Bull Regime."
     
-    # Vid Rebalance 2 (Date 9): Regime 2 (Crisis). Båda aktierna ska ha 0 vikt.
+    # Vid Rebalance 2 (Date 9): Regime 0.0 (Crisis). Båda aktierna ska ha 0 vikt.
     date2_res = res[res["date"] == dates[9]]
     assert date2_res["target_weight"].sum() == 0.0, "❌ FEL: Motorn ignorerade Crisis Regime (ska vara 0 exponering)."
     

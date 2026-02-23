@@ -39,7 +39,7 @@ def run_tests():
         hrp_weights,
         cov_matrix,
         nlp_multipliers,
-        macro_regime=0,
+        regime_exposure=1.0,
         historical_volatilities=hist_vols,
         target_vol_annual=target_vol,
     )
@@ -51,7 +51,7 @@ def run_tests():
         hrp_weights,
         cov_matrix,
         nlp_multipliers,
-        macro_regime=1,
+        regime_exposure=0.5,
         historical_volatilities=hist_vols,
         target_vol_annual=target_vol,
     )
@@ -63,7 +63,7 @@ def run_tests():
         hrp_weights,
         cov_matrix,
         nlp_multipliers,
-        macro_regime=2,
+        regime_exposure=0.0,
         historical_volatilities=hist_vols,
     )
     assert w_crisis.sum() == 0.0, "❌ FEL: Portföljen likviderades inte i Crisis Regime."
@@ -73,7 +73,7 @@ def run_tests():
         hrp_weights,
         cov_matrix,
         nlp_multipliers,
-        macro_regime=0,
+        regime_exposure=1.0,
         historical_volatilities=hist_vols,
         portfolio_drawdown=-0.12,
     )
@@ -86,7 +86,7 @@ def run_tests():
         bad_nlp = nlp_multipliers.copy()
         bad_nlp.index = ["A", "B", "C", "D"]
         vol_targeter.apply_targets(
-            hrp_weights, cov_matrix, bad_nlp, macro_regime=0,
+            hrp_weights, cov_matrix, bad_nlp, regime_exposure=1.0,
             historical_volatilities=hist_vols,
         )
         print("❌ FEL: Koden fångade inte Index Mismatch.")

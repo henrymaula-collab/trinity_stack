@@ -93,8 +93,10 @@ def _load_parquet_or_mock(name: str) -> pd.DataFrame:
         v2tx = 15 + np.cumsum(np.random.randn(n_days) * 2)
         breadth = 0.5 + np.cumsum(np.random.randn(n_days) * 0.1)
         rates = 0.01 + np.cumsum(np.random.randn(n_days) * 0.001)
+        rates_fi = 0.01 + np.cumsum(np.random.randn(n_days) * 0.001)
+        rates_se = 0.01 + np.cumsum(np.random.randn(n_days) * 0.001)
         return pd.DataFrame(
-            {"V2TX": v2tx, "Breadth": breadth, "Rates": rates},
+            {"V2TX": v2tx, "Breadth": breadth, "Rates": rates, "Rates_FI": rates_fi, "Rates_SE": rates_se},
             index=dates,
         )
 
@@ -149,14 +151,40 @@ def _build_price_returns_wide(raw_prices: pd.DataFrame) -> pd.DataFrame:
     return wide
 
 
+def _build_adv_series(raw_prices: pd.DataFrame, window_days: int = 20) -> pd.DataFrame:
+    """Build ADV (20d mean PX_TURN_OVER) per ticker, index=date, columns=ticker."""
+    if "PX_TURN_OVER" not in raw_prices.columns:
+        return pd.DataFrame()
+    px = raw_prices.copy()
+    px["date"] = pd.to_datetime(px["date"])
+    wide = px.pivot_table(index="date", columns="ticker", values="PX_TURN_OVER")
+    adv = wide.rolling(window_days, min_periods=1).mean()
+    return adv
+
+
+RECALIBRATION_INTERVAL = 21  # ~1 month; regimes don't shift daily
+
+
 def _build_macro_regime_series(
     macro_df: pd.DataFrame, detector: MacroRegimeDetector
 ) -> pd.DataFrame:
-    """Build regime time series using MacroRegimeDetector.predict_regime per date."""
+    """
+    Out-of-sample HMM: fit only on data up to t; periodic recalibration.
+    - Fit at recalibration dates (monthly); predict daily with last fitted model.
+    - No look-ahead: model at t uses only data up to last recal <= t.
+    """
     macro_df = macro_df.sort_index()
-    regimes: List[int] = []
+    regimes: List[float] = []
+    MIN_SAMPLES = 63
+    last_fit_i = -1
     for i in range(len(macro_df)):
         block = macro_df.iloc[: i + 1]
+        if len(block) < MIN_SAMPLES:
+            regimes.append(0.5)
+            continue
+        if last_fit_i < 0 or (i - last_fit_i) >= RECALIBRATION_INTERVAL:
+            detector.fit(block)
+            last_fit_i = i
         r = detector.predict_regime(block)
         regimes.append(r)
     return pd.DataFrame({"regime": regimes}, index=macro_df.index)
@@ -202,14 +230,13 @@ def run_pipeline() -> None:
 
     # ----- L1: Feature Engineering -----
     print("\n[L1] FeatureEngineer.build_features()...")
-    features_df = feature_engineer.build_features(raw_prices, raw_fundamentals)
+    features_df = feature_engineer.build_features(raw_prices, raw_fundamentals, macro_df=macro_df)
     if features_df.empty:
         raise ValueError("L1 output is empty")
     print(f"  Output: {len(features_df)} rows")
 
-    # ----- L2: Regime Detection -----
-    print("\n[L2] MacroRegimeDetector.fit() and predict_regime()...")
-    macro_detector.fit(macro_df)
+    # ----- L2: Regime Detection (expanding-window, no look-ahead) -----
+    print("\n[L2] MacroRegimeDetector expanding-window fit+predict...")
     macro_regime_df = _build_macro_regime_series(macro_df, macro_detector)
     print(f"  Regime series: {len(macro_regime_df)} dates")
 
@@ -263,15 +290,28 @@ def run_pipeline() -> None:
     ).tolist()
     if not rebalance_dates:
         raise ValueError("No rebalance dates in range")
-    backtest_result = backtest_engine.run_backtest(
+    adv_series = _build_adv_series(raw_prices)
+    portfolio_aum_ref = 1e6  # Reference AUM for capacity penalty
+    backtest_out = backtest_engine.run_backtest(
         price_df=price_returns,
         alpha_df=alpha_df,
         macro_df=macro_regime_df,
         news_df=news_df,
         rebalance_dates=rebalance_dates,
         currency_series=None,
+        adv_series=adv_series if not adv_series.empty else None,
+        portfolio_aum=portfolio_aum_ref if not adv_series.empty else None,
+        raw_prices=raw_prices,
+        macro_raw_df=macro_df,
+        use_pessimistic_execution=True,
     )
-    print(f"  backtest_result: {len(backtest_result)} weight records")
+    if isinstance(backtest_out, tuple):
+        backtest_result, pess_metrics = backtest_out
+        print(f"  backtest_result: {len(backtest_result)} weight records")
+        print(f"  Pessimistic Execution — Total_Friction_Cost_BPS: {pess_metrics.get('Total_Friction_Cost_BPS', 0):.1f}, Opportunity_Cost_BPS: {pess_metrics.get('Opportunity_Cost_BPS', 0):.1f}")
+    else:
+        backtest_result = backtest_out
+        print(f"  backtest_result: {len(backtest_result)} weight records")
 
     # ----- L6: Execution & TCA -----
     print("\n[L6] Extracting final target weights and generating orders...")
@@ -297,7 +337,6 @@ def run_pipeline() -> None:
         & set(current_prices.index)
         & set(spreads.index)
         & set(alpha_scores.index)
-        & set(price_returns.columns)
     )
     if len(tickers_common) < 2:
         print("  Insufficient overlap for ExecutionEngine; skipping.")
@@ -308,30 +347,46 @@ def run_pipeline() -> None:
     current_prices = current_prices.reindex(tickers_common).dropna()
     spreads = spreads.reindex(tickers_common)
     alpha_scores = alpha_scores.reindex(tickers_common)
-    trailing_mask = price_returns.index <= last_date
-    trailing_ret = price_returns.loc[trailing_mask, tickers_common].iloc[-252:]
 
     orders = execution_engine.generate_orders(
         target_weights=final_weights,
         current_prices=current_prices,
         spreads=spreads,
         alpha_scores=alpha_scores,
-        historical_returns=trailing_ret,
     )
     print(f"  Generated {len(orders)} orders.")
 
     regime_asof = macro_regime_df.loc[macro_regime_df.index <= last_date, "regime"].iloc[-1]
-    regime_int = int(regime_asof) if regime_asof in (0, 1, 2) else 0
+    regime_exposure = float(regime_asof)
+    regime_int = 0 if regime_exposure < 0.33 else (1 if regime_exposure < 0.66 else 2)
 
-    print("  TCA: Logging theoretical trades to SQLite...")
+    db_path = str(_PROJECT_ROOT / "data" / "tca" / "tca.db")
+    portfolio_aum_ref = 1e6
+    _sub = raw_prices[raw_prices["date"] <= last_price_date].sort_values(["ticker", "date"])
+    adv = (
+        _sub.groupby("ticker")["PX_TURN_OVER"]
+        .apply(lambda s: s.rolling(20, min_periods=1).mean().iloc[-1] if len(s) > 0 else np.nan)
+    )
+    print("  TCA: Logging theoretical trades to SQLite (with fill-calibration fields)...")
     for _, row in orders.iterrows():
+        t = row["ticker"]
+        tw = float(row["target_weight"])
+        order_size = tw * portfolio_aum_ref if portfolio_aum_ref else np.nan
+        adv_t = adv.get(t, np.nan) or np.nan
+        order_size_adv = (order_size / adv_t) if adv_t and adv_t > 0 else np.nan
+        spread_pct_val = float(spreads.get(t, 0.01))
         log_execution(
-            ticker=row["ticker"],
+            ticker=t,
             theoretical_price=row["limit_price"],
             filled_price=row["limit_price"],
             regime=regime_int,
-            target_weight=row["target_weight"],
-            db_path=str(_PROJECT_ROOT / "data" / "tca" / "tca.db"),
+            target_weight=tw,
+            db_path=db_path,
+            order_size_adv=float(order_size_adv) if not np.isnan(order_size_adv) else None,
+            spread_pct=spread_pct_val,
+            intraday_vol_proxy=0.01,
+            time_to_fill_sec=None,
+            fill_ratio=None,
         )
     print(f"  Logged {len(orders)} executions to {DEFAULT_DB_PATH}.")
 

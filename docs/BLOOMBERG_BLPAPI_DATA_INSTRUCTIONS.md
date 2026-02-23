@@ -1,4 +1,4 @@
-# Trinity Stack — Bloomberg BLPAPI Data Retrieval Instructions
+# Trinity Stack — Bloomberg BLPAPI & Capital IQ Data Instructions
 
 **Datum:** 2025-02  
 **Period:** 2006-01-01 → 2026-12-31  
@@ -8,35 +8,60 @@
 
 ---
 
+## 0. Arbetsfördelning: CapIQ vs. Bloomberg
+
+| Datatyp | Källa | Motivering |
+|---------|-------|------------|
+| **Pris & Marknad** | Bloomberg | Osagbar för OHLC, volym och makro |
+| **SUE & Estimering** | Bloomberg | BBG:s konsensus-feed (ANR) är standard |
+| **Debt Maturity** | Capital IQ | Mer detaljerad nedbrytning lån vs. obligationer |
+| **Supply Chain** | Capital IQ | "Business Relationships"-databasen är djupare för micro-caps |
+
+För nordiska småbolag är CapIQ objektivt överlägset för skuldväggar och leverantörsrelationer – analytiker manuellt rensar finansiella rapporter i högre grad än Bloombergs automatiska algoritmer för micro-caps.
+
+---
+
 ## 1. Förutsättningar
 
 - Bloomberg Terminal + B-PIPE (eller Data License) aktiv
-- Python med `blpapi` (eller `pdblp` som wrapper)
 - Starta Bloomberg Terminal innan du kör script (BLPAPI använder lokal session)
 
-### Installation
+**Primär implementering:** R med Rblpapi (se sektion 6b). Scripten `data1_BLOOMBERG.R` och `data2_BLOOMBERG.R` är redo att köras i RStudio på Bloomberg Terminal.
+
+**Alternativ (Python):**
 ```bash
-pip install pdblp
-# Eller: pip install blpapi  (officiell SDK)
+pip install pdblp   # eller: pip install blpapi (officiell SDK)
 ```
 
 ---
 
 ## 2. Fil 1: prices.parquet
 
-**Output-kolumner:** `date`, `ticker`, `PX_LAST`, `PX_TURN_OVER`, `BID_ASK_SPREAD_PCT` (alla i EUR)
+**Output-kolumner:** `date`, `ticker`, `PX_OPEN`, `PX_LAST`, `PX_HIGH`, `PX_LOW`, `PX_TURN_OVER`, `BID_ASK_SPREAD_PCT` (alla i EUR)
 
 ### BLPAPI / pdblp
 
 | Trinity-kolumn       | Bloomberg Field    | Anteckning                          |
 |----------------------|--------------------|-------------------------------------|
+| PX_OPEN              | `PX_OPEN`          | **KRITISKT för T+1.** Utan PX_OPEN lider "Pessimistisk exekvering" av look-ahead bias – du handlar i praktiken på dagens stängning trots att du inte vet stängningskursen förrän marknaden stängt. |
 | PX_LAST              | `PX_LAST` + overrides | **Måste vara justerad** för splits/utdelningar; i EUR (se FX nedan) |
-| PX_TURN_OVER         | `PX_TURN_OVER`     | **Daglig omsättning i valuta** (inte antal aktier). Amihud + Market Impact bygger på fiat. |
-| BID_ASK_SPREAD_PCT   | Beräkna            | `(PX_ASK - PX_BID) / PX_MID * 100`  |
+| PX_HIGH              | `PX_HIGH`          | För dags-volatilitet och fill-sannolikhetsmodell |
+| PX_LOW               | `PX_LOW`           | För dags-volatilitet |
+| PX_TURN_OVER         | `PX_TURN_OVER`     | **Daglig omsättning i valuta** (inte antal aktier). Amihud + Capacity + Participation Cap. |
+| BID_ASK_SPREAD_PCT   | Beräkna            | `(PX_ASK - PX_BID) / PX_MID * 100` (eller `(PX_ASK + PX_BID)/2`) |
 
-Om `PX_MID` saknas: använd `(PX_ASK - PX_BID) / PX_LAST * 100`.
-
-**Bloomberg Fields att hämta:** `PX_LAST`, `PX_TURN_OVER`, `PX_BID`, `PX_ASK`
+**Bloomberg Fields att hämta:**
+```python
+fields = [
+    "PX_OPEN",       # För T+1 entry – KRITISKT
+    "PX_LAST",       # För beräkning av avkastning
+    "PX_HIGH",       # För volatilitetsskalning
+    "PX_LOW",        # För volatilitetsskalning
+    "PX_TURN_OVER",  # För Amihud & Capacity
+    "PX_BID",        # För spread-beräkning
+    "PX_ASK",        # För spread-beräkning
+]
+```
 
 > **Omsättning vs volym:** `PX_VOLUME` (antal aktier) är felaktigt i småbolag – 10k aktier à 0,10 EUR ≠ 10k aktier à 100 EUR. `PX_TURN_OVER` = Daily Traded Value i lokal valuta.
 
@@ -67,16 +92,16 @@ overrides = [
 
 OMX Helsinki = EUR, OMX Stockholm = SEK. Rådata utan valutakonvertering gör att LightGBM blandar SEK och EUR i samma matris → korrupta beräkningar (Amihud, momentum, fundamentals).
 
-**Säkrast för Point-in-Time:** Hämta `SEKEUR Curncy` historiskt via bdh, multiplicera SEK-aktiernas PX_LAST och PX_TURN_OVER med valutakursen i Layer 1 (eller i datapreprocessering). Bevara PiT-noggrannhet.
-
-**Alternativ:** Bloomberg valuta-override i bdh (om tillgängligt för dina tickers). Men separat valutakurs + multiplikation i pandas är ofta säkrast.
+**Hämta `SEKEUR Curncy`** som separat tidsserie för att normalisera Stockholmstickers till EUR:
 
 ```python
-# Pseudokod: efter bdh-hämtning
+# Efter bdh-hämtning
 sek_tickers = [...]  # Lista över Stockholm-tickers
 fx = con.bdh("SEKEUR Curncy", "PX_LAST", start, end)  # SEK per 1 EUR
-# För varje rad där ticker in sek_tickers: PX_LAST *= fx.loc[date], PX_TURN_OVER *= fx.loc[date]
+# För varje rad där ticker in sek_tickers: PX_OPEN, PX_LAST, PX_HIGH, PX_LOW, PX_TURN_OVER *= fx.loc[date]
 ```
+
+**Alternativ:** Bloomberg valuta-override i bdh (om tillgängligt). Separat valutakurs + multiplikation i pandas är ofta säkrast.
 
 ### pdblp-exempel (Historical)
 
@@ -94,7 +119,7 @@ con = pdblp.BCon(debug=False, port=8194, timeout=60000)
 con.start()
 
 tickers = [...]  # Point-in-time universum (se ovan)
-fields = ["PX_LAST", "PX_TURN_OVER", "PX_BID", "PX_ASK"]  # PX_TURN_OVER, inte PX_VOLUME
+fields = ["PX_OPEN", "PX_LAST", "PX_HIGH", "PX_LOW", "PX_TURN_OVER", "PX_BID", "PX_ASK"]
 start, end = "20060101", "20261231"
 
 df = con.bdh(tickers, fields, start, end, longdata=True, ovrds=overrides)
@@ -174,15 +199,22 @@ Implementering: Hämta som referensdata, lägg till som kolumner i fundamentals.
 
 ## 4. Fil 3: macro.parquet
 
-**Output:** index = `date`, kolumner: `V2TX`, `Breadth`, `Rates`
+**Output:** index = `date`, kolumner: `V2TX`, `Breadth`, `Rates_FI`, `Rates_SE`, `MOVE` (valfritt)
 
 ### Bloomberg Fields
 
 | Trinity-kolumn | Bloomberg Ticker     | Bloomberg Field | Beskrivning          |
 |----------------|----------------------|-----------------|----------------------|
-| V2TX           | `V2TX Index`         | `PX_LAST`       | Euro Stoxx 50 Vol    |
-| Rates          | `GFFI10 Govt` (FI) eller `GSGB10YR Govt` (SE) | `PX_LAST` | 10Y ränta |
+| V2TX           | `V2TX Index`         | `PX_LAST`       | Euro Stoxx 50 Vol (regimskalning, spread stress) |
+| Rates           | `GDBR10 Govt`        | `PX_LAST`       | **Tysk 10Y (Bund)** – HMM-input, undviker multikollinearitet |
+| Rates_FI       | `GFFI10 Govt`        | `PX_LAST`       | 10Y ränta Finland (Local_Rate för FH-tickers) |
+| Rates_SE       | `GSGB10YR Govt`      | `PX_LAST`       | 10Y ränta Sverige (Local_Rate för SS-tickers) |
 | Breadth        | Hämta ej från BB     | —               | Beräkna från prices  |
+| MOVE           | `MOVE Index`         | `PX_LAST`       | **(Valfritt)** Räntevolatilitet. Kritiskt för Debt Wall – refinansieringsrisk korrelerar med MOVE |
+
+**Rates (HMM):** Tysk 10Y (Bund) är ortogonal och stabil för regimdetektering. Undvik räntespread (FI−SE) – den fångar valutadifferens, inte systematisk marknadsrisk.
+
+**Local_Rate (Layer 1):** Rates_FI och Rates_SE mappas dynamiskt per ticker (FH → Rates_FI, SS → Rates_SE) för excess return och räntekostnadstäckning.
 
 ### Breadth (beräkna själv)
 
@@ -191,10 +223,10 @@ Implementering: Hämta som referensdata, lägg till som kolumner i fundamentals.
 ### pdblp-exempel
 
 ```python
-macro_tickers = ["V2TX Index", "GFFI10 Govt", "GSGB10YR Govt"]
+macro_tickers = ["V2TX Index", "GFFI10 Govt", "GSGB10YR Govt", "MOVE Index"]  # MOVE valfritt
 macro_fields = ["PX_LAST"]
 df = con.bdh(macro_tickers, macro_fields, "20060101", "20261231")
-# Rename till V2TX, Rates. Breadth läggs till via beräkning från prices.parquet
+# Rename till V2TX, Rates_FI, Rates_SE. Breadth beräknas från prices.parquet
 ```
 
 ### Ungefärlig datapunkter
@@ -228,14 +260,43 @@ Om BLPAPI-news är begränsad: exportera news manuellt från Terminal (NAN, BN) 
 
 ---
 
+## 4a. Supply-Chain (CapIQ-fokus) – Spjutet
+
+**Output:** `date`, `supplier_ticker`, `customer_ticker`, `revenue_dependency_pct`
+
+Om CapIQ används: "Business Relationships"-databasen. Om Bloomberg används som fallback:
+
+| Trinity-kolumn | Bloomberg/Alternativ | Anteckning |
+|----------------|----------------------|------------|
+| revenue_dependency_pct | `SPLC_REVENUE_DEPENDENCY_PCT` | Procentuell andel intäkter från kund |
+| customer_ticker | `SPLC_CUSTOMER_TICKER` | Tickern för global kund (Mega-cap) |
+
+---
+
+## 4b. Debt Wall (CapIQ-fokus) – Skölden
+
+**Output:** `date`, `ticker`, `market_cap`, `cash_equivalents`, `ttm_fcf`, `next_12m_debt_maturity`, …
+
+CapIQ är överlägsen för skulddetaljer. Kravspecifikation för utdrag:
+
+| Trinity-kolumn | CapIQ / Bloomberg Field | Anteckning |
+|----------------|-------------------------|------------|
+| cash_equivalents | `BS_CASH_NEAR_CASH_ITEM` | Aktuell likviditet |
+| next_12m_debt_maturity | `DEBT_MATURITY_SCHEDULE_NEXT_12M` | Total skuld som förfaller inom ett år |
+| ttm_fcf | `FREE_CASH_FLOW_TTM` | För Burn rate – räcker kassan till förfallet? |
+
+---
+
 ## 6. Sammanfattning – exakta fält per dataset
 
 ```
 PRICES (bdh + overrides CshAdjNormal, CshAdjAbnormal, CapChgExec):
   tickers:  Point-in-time universum (INDX_MWEIGHT + END_DATE_OVERRIDE per månad, eller dead_tickers.csv)
-  fields:   PX_LAST, PX_TURN_OVER, PX_BID, PX_ASK
+  fields:   PX_OPEN, PX_LAST, PX_HIGH, PX_LOW, PX_TURN_OVER, PX_BID, PX_ASK
+  fx:       SEKEUR Curncy (separat tidsserie för Stockholm-tickers)
   period:   2006-01-01 → 2026-12-31
-  → Output: date, ticker, PX_LAST, PX_TURN_OVER, BID_ASK_SPREAD_PCT (alla i EUR, SEK konverterade)
+  → Output: date, ticker, PX_OPEN, PX_LAST, PX_HIGH, PX_LOW, PX_TURN_OVER, BID_ASK_SPREAD_PCT (alla i EUR)
+  → KRITISKT: PX_OPEN krävs för T+1 Pessimistisk exekvering. Utan den → look-ahead bias.
 
 FUNDAMENTALS:
   tickers:  [samma point-in-time som prices]
@@ -246,14 +307,37 @@ FUNDAMENTALS:
   → Dilution = EQY_SH_OUT_t / EQY_SH_OUT_{t-1year} (ersätter Piotroski_F)
 
 MACRO (bdh):
-  tickers:  V2TX Index, GFFI10 Govt (eller GSGB10YR Govt)
+  tickers:  V2TX Index, GDBR10 Govt (Bund), GFFI10 Govt, GSGB10YR Govt, MOVE Index (valfritt)
   fields:   PX_LAST
-  → Output: date, V2TX, Rates; Breadth beräknas i Layer 1 från prices (% tickers > 200d SMA)
+  → Output: date, V2TX, Breadth, Rates (Bund), Rates_FI, Rates_SE, MOVE
+  → Breadth beräknas i Layer 1 från prices (% tickers > 200d SMA)
+
+SUPPLY-CHAIN (CapIQ prioriterad):
+  → Output: date, supplier_ticker, customer_ticker, revenue_dependency_pct
+  → CapIQ: Business Relationships. BBG-fallback: SPLC_REVENUE_DEPENDENCY_PCT, SPLC_CUSTOMER_TICKER
+
+DEBT WALL (CapIQ prioriterad):
+  → Output: date, ticker, cash_equivalents, next_12m_debt_maturity, ttm_fcf, …
+  → CapIQ/BBG: BS_CASH_NEAR_CASH_ITEM, DEBT_MATURITY_SCHEDULE_NEXT_12M, FREE_CASH_FLOW_TTM
 
 NEWS:
   → Output: ticker, date, text
   → Via News API eller manuell export
 ```
+
+---
+
+## 6b. R-skript (Bloomberg i två delar)
+
+För att undvika kvotgräns – kör datamängden i två separata körningar:
+
+| Script | Innehåll | Output |
+|--------|----------|--------|
+| `docs/data1_BLOOMBERG.R` | Priser + FX (SEKEUR) | prices.parquet, fx_sekeur.parquet |
+| `docs/data2_BLOOMBERG.R` | Fundamentals, Macro, News | fundamentals.parquet, macro.parquet, news.parquet |
+| `docs/data_CAPITAL_IQ.R` | Supply Chain, Debt Wall | supply_chain.parquet, debt_wall.parquet |
+
+**Körning:** Öppna i RStudio på en Bloomberg Terminal, sätt `OUTPUT_DIR` och `TICKERS`, kör data1 först, sedan data2. CapIQ-scriptet förutsätter CSV-export från CapIQ Excel Add-in.
 
 ---
 

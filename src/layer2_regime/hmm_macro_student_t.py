@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
 from typing import List
 
 import numpy as np
@@ -11,10 +10,13 @@ REQUIRED_MACRO_COLS: List[str] = ["V2TX", "Breadth", "Rates"]
 PERSISTENCE_DAYS = 3
 CONFIDENCE_THRESHOLD = 0.70
 
+# Target exposures per state: 0=Normal, 1=Uncertain, 2=Crisis
+STATE_EXPOSURE: tuple[float, float, float] = (1.0, 0.5, 0.0)
+
 
 class MacroRegimeDetector:
     """
-    Layer 2 macro regime detection using Gaussian HMM on V2TX, Breadth, Rates.
+    Layer 2 macro regime detection using Gaussian HMM on V2TX, Breadth, Rates (Bund).
     Enforces 3-day persistence. (Liquidity Stress override is handled externally).
     """
 
@@ -46,13 +48,15 @@ class MacroRegimeDetector:
 
     def _reorder_states_by_variance(self) -> None:
         """
-        HMM outputs unordered states. Reorder so: 0=lowest var (Bull),
-        1=middle (Neutral), 2=highest (Crisis).
+        Deterministic state mapping to prevent label switching.
+        EM outputs unordered states; force 0=lowest var (Bull), 1=mid, 2=highest (Crisis).
+        Uses trace of covariance; tie-break by V2TX (col 0) mean for stability.
         """
         variances = np.array(
             [np.trace(self._hmm.covars_[k]) for k in range(self.n_states)]
         )
-        perm = np.argsort(variances)  # ascending: low, mid, high
+        means_v2tx = np.array([self._hmm.means_[k, 0] for k in range(self.n_states)])
+        perm = np.lexsort((variances, means_v2tx))  # primary: V2TX mean (crisis=high), secondary: var
         self._hmm.means_ = self._hmm.means_[perm]
         self._hmm.covars_ = self._hmm.covars_[perm]
         self._hmm.transmat_ = self._hmm.transmat_[perm, :][:, perm]
@@ -77,7 +81,13 @@ class MacroRegimeDetector:
             raise ValueError("X contains NaN or inf")
         return arr
 
-    def predict_regime(self, X: pd.DataFrame | np.ndarray) -> int:
+    def predict_regime(self, X: pd.DataFrame | np.ndarray) -> float:
+        """
+        Return continuous regime_exposure_scalar (0.0 to 1.0).
+
+        Uses predict_proba and dot product with state target exposures
+        (Normal=1.0, Uncertain=0.5, Crisis=0.0). Replaces discrete integer output.
+        """
         if not self._fitted:
             raise ValueError("Detector must be fitted before predict_regime")
 
@@ -86,29 +96,13 @@ class MacroRegimeDetector:
             raise ValueError("X has no samples")
 
         posteriors = self._hmm.predict_proba(arr)
-        regime = self._apply_persistence(posteriors)
-        return regime
+        smoothed = self._apply_persistence_smoothing(posteriors)
+        exposure = float(np.dot(smoothed, np.array(STATE_EXPOSURE)))
+        return max(0.0, min(1.0, exposure))
 
-    def _apply_persistence(self, posteriors: np.ndarray) -> int:
-        n = len(posteriors)
-        if n == 0:
+    def _apply_persistence_smoothing(self, posteriors: np.ndarray) -> np.ndarray:
+        """Average posteriors over persistence window; return last smoothed prob vector."""
+        if len(posteriors) == 0:
             raise ValueError("posteriors is empty")
-
-        current_regime = int(np.argmax(posteriors[0]))
-        window: deque[np.ndarray] = deque(maxlen=self.persistence_days)
-
-        for i in range(n):
-            window.append(posteriors[i])
-            if len(window) < self.persistence_days:
-                current_regime = int(np.argmax(posteriors[i]))
-                continue
-
-            qualified = [
-                s
-                for s in range(self.n_states)
-                if all(w[s] > self.confidence_threshold for w in window)
-            ]
-            if qualified:
-                current_regime = max(qualified, key=lambda s: posteriors[i][s])
-
-        return current_regime
+        window = posteriors[-self.persistence_days :]
+        return window.mean(axis=0).astype(np.float64)

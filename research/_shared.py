@@ -63,7 +63,9 @@ def _load_parquet_or_mock(name: str) -> pd.DataFrame:
         v2tx = 15 + np.cumsum(np.random.randn(n_days) * 2)
         breadth = 0.5 + np.cumsum(np.random.randn(n_days) * 0.1)
         rates = 0.01 + np.cumsum(np.random.randn(n_days) * 0.001)
-        return pd.DataFrame({"V2TX": v2tx, "Breadth": breadth, "Rates": rates}, index=dates)
+        rates_fi = 0.01 + np.cumsum(np.random.randn(n_days) * 0.001)
+        rates_se = 0.01 + np.cumsum(np.random.randn(n_days) * 0.001)
+        return pd.DataFrame({"V2TX": v2tx, "Breadth": breadth, "Rates": rates, "Rates_FI": rates_fi, "Rates_SE": rates_se}, index=dates)
     if name == "news":
         records = []
         for _ in range(50):
@@ -99,12 +101,24 @@ def _build_price_returns_wide(raw_prices: pd.DataFrame) -> pd.DataFrame:
     return wide
 
 
+RECALIBRATION_INTERVAL = 21
+
+
 def _build_macro_regime_series(macro_df: pd.DataFrame, detector) -> pd.DataFrame:
+    """Out-of-sample HMM: monthly recalibration, daily predict — no look-ahead."""
     macro_df = macro_df.sort_index()
     regimes = []
+    MIN_SAMPLES = 63
+    last_fit_i = -1
     for i in range(len(macro_df)):
-        r = detector.predict_regime(macro_df.iloc[: i + 1])
-        regimes.append(r)
+        block = macro_df.iloc[: i + 1]
+        if len(block) < MIN_SAMPLES:
+            regimes.append(0.5)
+            continue
+        if last_fit_i < 0 or (i - last_fit_i) >= RECALIBRATION_INTERVAL:
+            detector.fit(block)
+            last_fit_i = i
+        regimes.append(detector.predict_regime(block))
     return pd.DataFrame({"regime": regimes}, index=macro_df.index)
 from src.layer1_data.feature_engineering import FeatureEngineer
 from src.layer2_regime.hmm_macro_student_t import MacroRegimeDetector
@@ -124,6 +138,9 @@ class _NeutralNLP:
         return 1.0
 
 
+feature_engineer = FeatureEngineer()
+
+
 def setup_research_data() -> Tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -137,12 +154,10 @@ def setup_research_data() -> Tuple[
     Returns (alpha_df, price_returns, macro_regime_df, news_df, raw_prices, rebalance_dates).
     """
     raw_prices, raw_fundamentals, macro_df, news_df = _research_load_data()
-    feature_engineer = FeatureEngineer()
     macro_detector = MacroRegimeDetector(random_state=GLOBAL_SEED)
-    macro_detector.fit(macro_df)
     macro_regime_df = _build_macro_regime_series(macro_df, macro_detector)
 
-    features_df = feature_engineer.build_features(raw_prices, raw_fundamentals)
+    features_df = feature_engineer.build_features(raw_prices, raw_fundamentals, macro_df=macro_df)
     momentum_gen = MomentumGenerator()
     lgbm_gen = LightGBMGenerator()
     alpha_ensemble = AlphaEnsemble()

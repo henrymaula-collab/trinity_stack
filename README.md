@@ -30,8 +30,8 @@ Layer 6: Execution & TCA         → Orders + SQLite logging
 | **L2** | Macro HMM + Liquidity overlay | Regime state (multi-state), liquidity stress indicator |
 | **L3** | Momentum + LightGBM + IC ensemble | Alpha scores (ranked) |
 | **L4** | NLP Sentinel | Risk multipliers (negative event penalties) |
-| **L5** | HRP + dynamic vol target | Target weights |
-| **L6** | Execution engine + TCA | Limit orders, stop-loss, SQLite logs |
+| **L5** | HRP + dynamic vol target + capacity penalty | Target weights |
+| **L6** | Execution engine + TCA + fill-probability model | Limit orders, SQLite logs (extended schema) |
 
 ---
 
@@ -45,9 +45,9 @@ Layer 6: Execution & TCA         → Orders + SQLite logging
 
 **Layer 4** — Transformer-based sentiment on corporate actions; penalty for extreme negative events with exponential recovery decay.
 
-**Layer 5** — Currency-isolated HRP; inverse volatility intra-cluster; dynamic vol target; drawdown overlay.
+**Layer 5** — Currency-isolated HRP; inverse volatility intra-cluster; dynamic vol target; drawdown overlay; capacity penalty (ADV / position_size).
 
-**Layer 6** — Conviction-scaled limit pricing; Expected Shortfall stop-loss; TCA logging.
+**Layer 6** — Conviction-scaled limit pricing; TCA logging with fill-calibration fields; FillProbabilityModel (logistic) for realistic fill estimates. No mechanical market stop-losses.
 
 ---
 
@@ -95,8 +95,11 @@ trinity_stack/
 │   ├── 03_statistical_robustness.py
 │   ├── 04_champion_vs_challenger.py
 │   ├── 05_tearsheet_and_benchmarks.py
+│   ├── 06_marginal_contribution.py
+│   ├── 07_fragility_and_capacity.py
 │   └── README.md
 ├── docs/
+│   ├── SYSTEM_ARCHITECTURE_AND_VALIDATION.md
 │   └── BLOOMBERG_BLPAPI_DATA_INSTRUCTIONS.md
 ├── data/
 │   ├── raw/                 # Parquet: prices, fundamentals, macro, news
@@ -109,7 +112,7 @@ trinity_stack/
 │   ├── layer3_alpha/        # Momentum, LightGBM, ensemble
 │   ├── layer4_nlp/          # NLP sentinel
 │   ├── layer5_portfolio/    # HRP, vol targeting
-│   ├── layer6_execution/    # Order generator, TCA logger
+│   ├── layer6_execution/    # Order generator, TCA logger, fill-probability model
 │   └── engine/              # Backtest loop
 └── test_*.py                # Layer tests
 ```

@@ -1,6 +1,6 @@
 """
 Layer 5: Dynamic volatility targeting and regime scaling.
-Applies NLP multipliers, macro regime exposure, and vol target with leverage cap.
+Applies NLP multipliers, macro regime exposure, vol target, and capacity penalty.
 """
 
 from __future__ import annotations
@@ -13,12 +13,9 @@ MAX_LEVERAGE: float = 1.5
 TARGET_VOL_MULTIPLIER: float = 0.80
 DRAWDOWN_THRESHOLD: float = -0.10
 DRAWDOWN_CUT: float = 0.80
+CAPACITY_K: float = 1.0  # capacity_penalty = min(1, k * ADV / position_size)
 
-REGIME_EXPOSURE: dict[int, float] = {
-    0: 1.0,
-    1: 0.5,
-    2: 0.0,
-}
+# Continuous regime exposure (0.0–1.0) used directly as regime_scale
 
 
 def _align_indices(
@@ -59,21 +56,23 @@ class DynamicVolTargeting:
         hrp_weights: pd.Series,
         cov_matrix: pd.DataFrame,
         nlp_multipliers: pd.Series,
-        macro_regime: int,
+        regime_exposure: float,
         historical_volatilities: pd.Series,
         portfolio_drawdown: float = 0.0,
         target_vol_annual: float | None = None,
+        adv_series: pd.Series | None = None,
+        portfolio_aum: float | None = None,
     ) -> pd.Series:
         """
         Step 1: Multiply by nlp_multipliers, renormalize.
-        Step 2: Scale by regime exposure (0->1.0, 1->0.5, 2->0.0).
+        Step 2: Scale by continuous regime exposure (0.0–1.0).
         Step 3: Target vol = 0.80 * median(historical_volatilities) if not overridden.
         Step 4: Scale to target vol, cap leverage at 1.5x.
         Step 5: If portfolio_drawdown <= -0.10, cut gross exposure by 20% (multiply by 0.80).
         """
         _align_indices(hrp_weights, cov_matrix, nlp_multipliers, historical_volatilities)
-        if macro_regime not in REGIME_EXPOSURE:
-            raise ValueError(f"macro_regime must be 0, 1, or 2; got {macro_regime}")
+        if not (0.0 <= regime_exposure <= 1.0):
+            raise ValueError(f"regime_exposure must be in [0, 1]; got {regime_exposure}")
 
         w = hrp_weights * nlp_multipliers
         s = w.sum()
@@ -81,7 +80,7 @@ class DynamicVolTargeting:
             raise ValueError("Sum of hrp_weights * nlp_multipliers must be positive")
         w = w / s
 
-        regime_scale = REGIME_EXPOSURE[macro_regime]
+        regime_scale = regime_exposure
         w = w * regime_scale
         if regime_scale == 0:
             return w
@@ -107,5 +106,19 @@ class DynamicVolTargeting:
 
         if portfolio_drawdown <= DRAWDOWN_THRESHOLD:
             w = w * DRAWDOWN_CUT
+
+        # Capacity penalty: avoid over-allocating to illiquid names
+        if adv_series is not None and portfolio_aum is not None and portfolio_aum > 0:
+            adv = adv_series.reindex(w.index).fillna(0.0)
+            position_size = w.abs() * portfolio_aum
+            capacity_penalty = pd.Series(1.0, index=w.index)
+            mask = (position_size > 0) & (adv > 0)
+            capacity_penalty.loc[mask] = np.minimum(
+                1.0, CAPACITY_K * adv.loc[mask] / position_size.loc[mask]
+            )
+            w = w * capacity_penalty
+            s = w.sum()
+            if s > 0:
+                w = w / s
 
         return w

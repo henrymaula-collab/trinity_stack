@@ -1,6 +1,8 @@
 """
 Layer 6: TCA (Transaction Cost Analysis) SQLite logger.
 Logs theoretical vs filled prices, timestamp, regime label.
+Extended schema for fill-probability calibration: order_size_adv, spread_pct,
+intraday_vol_proxy, time_to_fill, fill_ratio.
 """
 
 from __future__ import annotations
@@ -27,6 +29,26 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
     """)
     conn.commit()
+    _ensure_fill_columns(conn)
+
+
+def _ensure_fill_columns(conn: sqlite3.Connection) -> None:
+    """Add fill-calibration columns if missing (migration)."""
+    info = conn.execute("PRAGMA table_info(tca_log)").fetchall()
+    cols = {r[1] for r in info}
+    for col, typ in [
+        ("order_size_adv", "REAL"),
+        ("spread_pct", "REAL"),
+        ("intraday_vol_proxy", "REAL"),
+        ("time_to_fill_sec", "REAL"),
+        ("fill_ratio", "REAL"),
+    ]:
+        if col not in cols:
+            try:
+                conn.execute(f"ALTER TABLE tca_log ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass
+    conn.commit()
 
 
 def log_execution(
@@ -37,8 +59,13 @@ def log_execution(
     target_weight: float,
     timestamp: Optional[pd.Timestamp] = None,
     db_path: str = DEFAULT_DB_PATH,
+    order_size_adv: Optional[float] = None,
+    spread_pct: Optional[float] = None,
+    intraday_vol_proxy: Optional[float] = None,
+    time_to_fill_sec: Optional[float] = None,
+    fill_ratio: Optional[float] = None,
 ) -> None:
-    """Append one TCA record. Fail on invalid inputs."""
+    """Append one TCA record. Fail on invalid inputs. Optional fill-calibration fields."""
     if theoretical_price <= 0 or filled_price <= 0:
         raise ValueError("Prices must be positive")
     if regime not in (0, 1, 2):
@@ -50,8 +77,13 @@ def log_execution(
     try:
         _ensure_schema(conn)
         conn.execute(
-            "INSERT INTO tca_log (timestamp, ticker, theoretical_price, filled_price, regime, target_weight) VALUES (?, ?, ?, ?, ?, ?)",
-            (ts, ticker, theoretical_price, filled_price, regime, target_weight),
+            "INSERT INTO tca_log (timestamp, ticker, theoretical_price, filled_price, regime, target_weight, "
+            "order_size_adv, spread_pct, intraday_vol_proxy, time_to_fill_sec, fill_ratio) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ts, ticker, theoretical_price, filled_price, regime, target_weight,
+                order_size_adv, spread_pct, intraday_vol_proxy, time_to_fill_sec, fill_ratio,
+            ),
         )
         conn.commit()
     finally:
