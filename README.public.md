@@ -26,28 +26,28 @@ Layer 6: Execution & TCA         → Orders + SQLite logging
 
 | Layer | Module | Output |
 |-------|--------|--------|
-| **L1** | Feature engineering | Quality Score, SUE, Amihud, Vol Compression, seasonality features, trend metrics |
-| **L2** | Macro HMM + Liquidity overlay | Regime state (multi-state), liquidity stress indicator |
-| **L3** | Momentum + LightGBM + IC ensemble | Alpha scores (ranked) |
-| **L4** | NLP Sentinel | Risk multipliers (negative event penalties) |
-| **L5** | HRP + dynamic vol target + capacity penalty | Target weights |
-| **L6** | Execution engine + TCA + fill-probability model | Limit orders, SQLite logs |
+| **L1** | Feature engineering | Quality Score, SUE, Amihud, Vol Compression, toxicity filters, VWAP returns |
+| **L2** | Macro HMM + Liquidity overlay + Liquidity decay model | Regime state, liquidity stress; reflexivity (L(t)=L₀·e^(-α·V/ADV)); Reflexivity Sensitivity |
+| **L3** | Momentum + LightGBM + IC ensemble + CPCV | Alpha scores (ranked) |
+| **L4** | NLP Sentinel | Risk multipliers |
+| **L5** | HRP + dynamic vol target + capacity penalty + FX hedging | Target weights |
+| **L6** | Execution engine + TCA + fill-probability + Reflexivity Circuit Breaker + Live paper trading | Limit orders; implementation_shortfall.db; capital scaling pause |
 
 ---
 
 ## Layer Details (High-Level)
 
-**Layer 1** — PEAD/SUE, quality composite (Z(ROIC) - Z(Dilution)), Amihud illiquidity (PX_TURN_OVER), volatility compression, seasonality, trend-shield features.
+**Layer 1** — PEAD/SUE, quality composite, Amihud, volatility compression, toxicity filters (toxicity_block, toxic_print_day), VWAP-based returns.
 
-**Layer 2** — HMM on macro factors; persistence rule for regime stability; liquidity overlay on spread expansion beyond historical norm.
+**Layer 2** — HMM on macro; liquidity overlay; liquidity decay (L(t)=L₀·e^(-α·V/ADV)); Reflexive Alpha Decay; Self-Impact; Predatory Alert; Reflexivity Sensitivity report.
 
-**Layer 3** — Hard filters (quality, spread, volume); cross-sectional momentum (with short-term reversal exclusion); LightGBM on fundamentals and microstructure; IC stability weighting; turnover hysteresis.
+**Layer 3** — Hard filters; momentum + LightGBM; IC stability weighting; turnover hysteresis; CPCV.
 
-**Layer 4** — Transformer-based sentiment on corporate actions; penalty for extreme negative events with exponential recovery decay.
+**Layer 4** — Transformer-based sentiment; penalty for extreme negative events; exponential recovery.
 
-**Layer 5** — Currency-isolated HRP; inverse volatility intra-cluster; dynamic vol target; drawdown overlay; capacity penalty.
+**Layer 5** — Currency-isolated HRP; dynamic vol target; drawdown overlay; capacity penalty; FX hedging report.
 
-**Layer 6** — Conviction-scaled limit pricing; TCA logging with fill-calibration; FillProbabilityModel. No mechanical market stop-losses.
+**Layer 6** — Conviction-scaled limit; pessimistic execution (T+1 VWAP); FillProbabilityModel; Reflexivity Circuit Breaker; live paper trading + implementation_shortfall.db. No mechanical market stop-losses.
 
 ---
 
@@ -89,29 +89,16 @@ streamlit run dashboard/streamlit_app.py
 trinity_stack/
 ├── run_pipeline.py          # Master orchestrator (L1–L6)
 ├── requirements.txt
-├── research/                # Academic hypothesis testing (isolated)
-│   ├── 01_ablation_study.py
-│   ├── 02_market_impact.py
-│   ├── 03_statistical_robustness.py
-│   ├── 04_champion_vs_challenger.py
-│   ├── 05_tearsheet_and_benchmarks.py
-│   └── README.md
+├── research/                # 01–08 scripts + _shared
 ├── docs/
-│   └── BLOOMBERG_BLPAPI_DATA_INSTRUCTIONS.md
-├── data/
-│   ├── raw/                 # Parquet: prices, fundamentals, macro, news
-│   └── tca/                 # SQLite TCA log
+│   ├── BLOOMBERG_BLPAPI_DATA_INSTRUCTIONS.md
+│   ├── data1_BLOOMBERG.R
+│   ├── data2_BLOOMBERG.R
+│   └── data_CAPITAL_IQ.R
+├── data/raw/, data/tca/
 ├── dashboard/
-│   └── streamlit_app.py     # TCA dashboard
-├── src/
-│   ├── layer1_data/         # Feature engineering
-│   ├── layer2_regime/       # Macro + liquidity regime
-│   ├── layer3_alpha/        # Momentum, LightGBM, ensemble
-│   ├── layer4_nlp/          # NLP sentinel
-│   ├── layer5_portfolio/    # HRP, vol targeting
-│   ├── layer6_execution/    # Order generator, TCA logger
-│   └── engine/              # Backtest loop
-└── test_*.py                # Layer tests
+├── src/layer1_data/, layer2_regime/, layer3_alpha/, layer4_nlp/, layer5_portfolio/, layer6_execution/
+└── engine/
 ```
 
 ---

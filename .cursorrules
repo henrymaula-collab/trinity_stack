@@ -30,17 +30,13 @@ You are a senior Quantitative Developer building an institutional-grade monthly 
 
 ### Layer 1: Data & Microstructure (/src/layer1_data/)
 * Output: Clean monthly feature matrix (PiT safe).
-* Features:
-  - PEAD / SUE: (Actual EPS - Consensus EPS) / std(EPS Forecast Error).
-  - Quality Composite: Z(ROIC) - Z(Dilution). Dilution = EQY_SH_OUT_t / EQY_SH_OUT_{t-1y}.
-  - Amihud Illiquidity: abs(Return) / Volume.
-  - Cross-Sectional Volatility Compression.
+* Features: PEAD/SUE; Quality Composite Z(ROIC)-Z(Dilution); Amihud; Vol Compression. Toxicity: toxicity_block (zero turnover 5d->block 5d); toxic_print_day (VWAP missing or >5% deviance from PX_LAST). VWAP-based returns when available. Insider cluster (optional).
 
 ### Layer 2: Regime Detection (/src/layer2_regime/)
 * Output: Monthly regime state vector.
-* Macro (hmmlearn): Student-t Hidden Markov Model on V2TX, Breadth, Rates. 
-  - Constraint: 3-day State Persistence (>70% confidence required to switch).
-* Micro (Liquidity Overlay): If average bid-ask spread expands > 1.5 sigma from historical mean -> trigger 'Liquidity Stress' mode.
+* Macro (hmmlearn): Student-t HMM on V2TX, Breadth, Rates. State Persistence constraint.
+* Micro (Liquidity Overlay): Spread > 1.5 sigma -> Liquidity Stress.
+* Liquidity Decay Model: L(t)=L0*exp(-α*V/ADV); α from bid/ask bounce; Reflexive Alpha Decay (participation >5%); Self-Impact >15% -> Predatory Alert; Reflexivity Sensitivity (break-even α); Circuit Breaker -> Passive Stealth/Halt.
 
 ### Layer 3: Alpha Generation (/src/layer3_alpha/)
 * Output: Ranked alpha signal (monthly).
@@ -63,11 +59,9 @@ You are a senior Quantitative Developer building an institutional-grade monthly 
 * Capacity Penalty: min(1, k * ADV / position_size) when adv_series and portfolio_aum provided. Avoids over-allocating to illiquid names.
 
 ### Layer 6: Execution & TCA (/dashboard/ and /data/tca/)
-* Output: Streamlit UI and SQLite TCA logs.
-* Execution (Conviction Scaled Limit): 
-  - Top 5% Alpha Rank: Limit = MidPrice - (0.25 * Spread).
-  - Normal Liquidity: Limit = MidPrice - (0.40 * Spread).
-  - Bottom 30% Liquidity: Limit = MidPrice - (0.75 * Spread).
-* Risk: Handled ex-ante via position limits, regime scalar, HRP. No mechanical market stop-losses (gap-down liquidity traps in illiquid small caps).
-* TCA: Log theoretical vs filled prices in SQLite. Extended schema: order_size_adv, spread_pct, intraday_vol_proxy, time_to_fill_sec, fill_ratio for FillProbabilityModel calibration.
-* FillProbabilityModel: Logistic fill_prob = sigmoid(a - b*order_size_adv - c*spread_pct - d*intraday_vol). Calibrate from TCA when fill_ratio observed.
+* Output: Streamlit UI, SQLite TCA, implementation_shortfall.db.
+* Execution (Conviction Scaled Limit): Top 5% Alpha = 0.25×Spread; Normal = 0.40×; Bottom 30% = 0.75×. Pessimistic: T+1 VWAP; step-function impact; execution collapse >15% participation; 50 bps news adverse selection.
+* FillProbabilityModel: Probabilistic fill; 5% participation cap; limit penetration ≥1 tick; spill-over/overnight gap; adversarial stress (30/70 fill, Sharpe < 0.8 → reject).
+* Reflexivity Circuit Breaker: Spread widens >50% from pre-slice snapshot → Toxic Flow, cancel remainder.
+* Live Paper Trading: Micro-lot execution; implementation_shortfall.db; capital scaling pause when rolling 30d realized > simulated slippage.
+* Risk: Ex-ante via position limits, regime scalar, HRP. No mechanical market stop-losses.

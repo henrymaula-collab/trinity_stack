@@ -46,34 +46,41 @@ Ingen layer får importera logik från en annan layer; endast output (DataFrame/
 **Huvudkomponenter:**
 - `FeatureEngineer` — bygger features från råpriser och fundamentals
 - `TripleLagEngine` — T+2 lag på fundamentaldata (eliminerar look-ahead bias)
+- `apply_stale_price_handling` — toxicity filters, VWAP-based returns
 
 **Features:**
 - **PEAD/SUE:** `(Actual EPS - Consensus EPS) / std(EPS Forecast Error)`
 - **Quality Composite:** `Z(ROIC) - Z(Dilution)` där Dilution = EQY_SH_OUT_t / EQY_SH_OUT_{t-1y}
 - **Amihud Illiquidity:** `|Return| / Volume` (likviditetsmått)
 - **Cross-Sectional Volatility Compression**
+- **Toxicity filters:** `toxicity_block` (noll omsättning senaste 5 dagar → block 5 dagar); `toxic_print_day` (VWAP saknas eller >5 % avvikelse från PX_LAST)
+- **VWAP-based returns:** När VWAP_CP finns, annars PX_LAST; toxic/stale → NaN
+- **Insider cluster signal:** (valfritt) Disclosure-date only, turnover-filtrerad
 
 **Kritiskt:** Alla rolling-statistik använder `.shift(1)`. Fundamentaldata lagras minst T+2 handelsdagar.
 
 ### 2.3 Layer 2: Regime Detection (`src/layer2_regime/`)
 
-**Output:** Kontinuerlig regime_exposure (float 0.0–1.0).
+**Output:** Kontinuerlig regime_exposure (float 0.0–1.0); liquidity decay / reflexivity-modeller.
 
 **Huvudkomponenter:**
-- `MacroRegimeDetector` — Gaussian HMM på V2TX, Breadth, Rates. Använder `predict_proba()` i stället för diskret `predict()`. Kontinuerlig exposure = dot product av state-sannolikheter och target exposures (Normal=1.0, Uncertain=0.5, Crisis=0.0).
+- `MacroRegimeDetector` — Student-t HMM på V2TX, Breadth, Rates. Kontinuerlig exposure = dot product av state-sannolikheter och target exposures (Normal=1.0, Uncertain=0.5, Crisis=0.0).
 - `LiquidityOverlay` — Om spread > 1.5σ från historiskt medelvärde → Liquidity Stress
+- `liquidity_decay_model` — **Dynamisk likviditetsavfall:** L(t) = L₀·e^(-α·V_trinity/ADV). α (Resilience Factor) från bid/ask bounce. **Reflexive Alpha Decay:** participation >5% → alpha erosion. **Endogenous Risk Engine:** Self-Impact-metrik; >15% av dagens trend → Predatory Trading Alert. **Reflexivity Sensitivity:** Break-even α (Sharpe→0) = Fragility Point. Circuit Breaker: Alert → Passive Stealth eller Halt.
 
-**Continuous Regime Scaling:** Regime exposure är en float 0.0–1.0 som används direkt som skalningsfaktor (inget diskret 0/1/2-steg).
+**Continuous Regime Scaling:** Regime exposure är en float 0.0–1.0 som används direkt som skalningsfaktor.
 
 ### 2.4 Layer 3: Alpha Generation (`src/layer3_alpha/`)
 
 **Output:** Rankade alphasignaler (cross-sectionell).
 
-**Hard Filters:** Kasta lägsta Quality Score-kvartilen, spread > 3 %, otillräcklig volym.
+**Hard Filters:** Kasta lägsta Quality Score-kvartilen, spread > 3 %, otillräcklig volym. Ytterligare: toxic_block, toxic_print_day, is_stale_price blockar exekvering.
 
-**Ensemble:** Momentum + LightGBM med IC-stabilitetsviktning. Model weight = IC / std(IC), begränsad till [0.3, 0.7]. Modellen tränas via Expanding Walk-Forward med karantänperiod. **Regel:** purge_days måste vara ≥ forward_return_horizon (1-dag default). Vid 21-dagars target krävs purge_days ≥ 21. Default: max(1, 5) = 5 för 1-dagars forward_return.
+**Ensemble:** Momentum + LightGBM med IC-stabilitetsviktning. Model weight = IC / std(IC), begränsad till [0.3, 0.7]. Expanding Walk-Forward; purge_days ≥ forward_return_horizon.
 
-**ExpandingWalkForwardCV** (`src/layer3_alpha/expanding_walk_forward_cv.py`): Klass för att generera (train_idx, test_idx)-splits. Används av LightGBMGenerator internt; kan användas för hyperparameteroptimering (grid/random search över folds).
+**ExpandingWalkForwardCV** (`expanding_walk_forward_cv.py`): Genererar (train_idx, test_idx)-splits för LightGBM och hyperparameteroptimering.
+
+**CPCV** (`cpcv.py`): Combinatorially Symmetric Cross-Validation; Deflated Sharpe Ratio för flera parameterkombinationer; PBO, IQR av Sharpe-fördelning.
 
 **Soft Decay Hysteresis:** Sell-threshold startar högt på T+1 och fasar ut linjärt över 60 dagar (ingen framtidsrank).
 
@@ -95,38 +102,46 @@ Ingen layer får importera logik från en annan layer; endast output (DataFrame/
 
 **Drawdown Overlay:** Vid portfölj-DD ≤ -10 % → skär gross exposure med 20 %.
 
-**Capacity Penalty:** När ADV och portfolio_aum anges: `capacity_penalty = min(1, k * ADV / position_size)`. Förhindrar överallokering till illikvida namn.
+**Capacity Penalty:** När ADV och portfolio_aum anges: `capacity_penalty = min(1, k * ADV / position_size)`.
+
+**FX Hedging** (`fx_hedging.py`): Tre spår — Unhedged, Always Hedged, Regime Hedged (hedga endast vid låg regime). Sharpe och Max DD per spår och regime. Rapporteras i pipeline vid tillgänglig FX-data.
 
 ### 2.7 Layer 6: Execution & TCA (`src/layer6_execution/`, `dashboard/`)
 
-**Output:** Limit orders, SQLite TCA-loggar. **Inga mekaniska market stop-losses.**
+**Output:** Limit orders; SQLite TCA; implementation_shortfall.db; reflexivity circuit breaker. **Inga mekaniska market stop-losses.**
 
-**Limit-prissättning (conviction-skalad):**
+**Order generator (conviction-skalad limit):**
 - Top 5 % Alpha Rank: Limit = MidPrice - (0.25 × Spread)
 - Normal likviditet: Limit = MidPrice - (0.40 × Spread)
 - Bottom 30 % likviditet: Limit = MidPrice - (0.75 × Spread)
 
-**Risk:** Hanteras ex-ante via positionsgränser, regime-skalär och HRP. I illikvida småbolag orsakar mekaniska market stops gap-down likviditetsfällor — därför är Expected Shortfall/stop-loss borttagen.
+**Pessimistic Execution Engine:** BUY at Ask + 0.1%×vol, SELL at Bid - 0.1%×vol. Top 10% alpha = price taker. Spread stress 2.5× when regime < 0.5 or V2TX > 25. **T+1 execution:** Signal vid rb_date → exekvering vid VWAP_CP nästa handelsdag. **Step-function impact** (ersätter square-root); liquidity cliff (3× spread vid >2% participation). News-driven signals: 50 bps adverse selection. **Execution collapse:** participation >15% → avslå order, behåll position (inventory risk). Rejected sells, Time-in-Market extension loggas.
 
-**TCA:** Loggar teoretiskt vs fyllt pris i SQLite med timestamp och regime-label. Utökat schema för fill-probability-kalibrering: `order_size_adv`, `spread_pct`, `intraday_vol_proxy`, `time_to_fill_sec`, `fill_ratio`.
+**FillProbabilityModel:** Probabilistisk fill; strikt limit penetration ≥1 tick; 5% participation cap av synlig volym; spill-over/overnight gap risk; alpha-liquidity correlation; adversarial stress test (30/70 fill, Sharpe < 0.8 → reject).
 
-**FillProbabilityModel:** Logistisk modell `fill_prob = sigmoid(a - b×order_size_adv - c×spread_pct - d×intraday_vol)`. Kalibreras från historisk TCA när `fill_ratio` observeras.
+**Reflexivity Circuit Breaker** (`order_generator.py`): Snapshot spread/depth före TWAP/VWAP-slice. Efter delvis fill: om spread vidgas >50% → klassificera som Toxic Flow, avbryt resterande volym.
 
-**Pessimistic Execution Engine:** Survival over theoretical profit. BUY at Ask + 0.1%×vol, SELL at Bid - 0.1%×vol. Top 10% alpha = price taker. Spread stress 2.5× when regime < 0.5 or V2TX > 25. 5% participation cap per day. T+1 execution. Output: `Total_Friction_Cost_BPS`, `Opportunity_Cost_BPS`.
+**Live Paper Trading** (`live_paper_trading.py`): Broker-connector (IB/Infront); micro-lot (1 aktie/signal); implementation_shortfall.db (teoretiskt vs realiserat pris). Regel: om rullande 30d realiserat slippage > simulerat → pausa kapitalskalning.
+
+**TCA:** SQLite med `order_size_adv`, `spread_pct`, `intraday_vol_proxy`, `time_to_fill_sec`, `fill_ratio` för FillProbabilityModel-kalibrering.
+
+**Risk:** Hanteras ex-ante via positionsgränser, regime-skalär, HRP. Inga mekaniska market stops.
 
 ### 2.8 Trinity-dataström
 
 ```
 data/raw/*.parquet (prices, fundamentals, macro, news)
     → Layer 1: features_df
-    → Layer 2: regime_df, liquidity_stress
+    → Layer 2: regime_df, liquidity_stress, liquidity_decay
     → Layer 3: alpha_df
     → Layer 4: nlp_multipliers (in-backtest)
     → Layer 5: target_weights
-    → Layer 6: orders + TCA
+    → Layer 6: orders + TCA + implementation_shortfall
 ```
 
 **Körning:** `python run_pipeline.py`
+
+**Datainsamling (Bloomberg):** Kör `docs/data1_BLOOMBERG.R` först (prices, FX). Session-tidsstämplade batch-filer undviker överskrivning vid återupptagning. Sedan `docs/data2_BLOOMBERG.R` (fundamentals, macro). PiT-universum från `nordic_historical_universe.csv`; fundamentals endast via bdh(). Dilution = EQY_SH_OUT_t / lag(EQY_SH_OUT, 4) - 1.
 
 ---
 
@@ -318,25 +333,36 @@ trinity_stack/
 │   ├── cost_of_borrowing.py
 │   └── backtest_debt_wall.py
 ├── src/
-│   ├── layer1_data/
-│   ├── layer2_regime/
-│   ├── layer3_alpha/
+│   ├── layer1_data/             # feature_engineering, triple_lag
+│   ├── layer2_regime/           # hmm_macro_student_t, liquidity_overlay, liquidity_decay_model
+│   ├── layer3_alpha/            # signal_generators, ic_weighted_ensemble, cpcv
 │   ├── layer4_nlp/
-│   ├── layer5_portfolio/
-│   ├── layer6_execution/
-│   └── engine/
+│   ├── layer5_portfolio/        # hrp_clustering, dynamic_vol_target, fx_hedging
+│   ├── layer6_execution/        # order_generator, tca_logger, fill_probability_model, pessimistic_execution, live_paper_trading
+│   └── engine/                  # backtest_loop
 ├── dashboard/
 │   └── streamlit_app.py
 ├── data/
 │   ├── raw/                     # Parquet: prices, fundamentals, macro, news
 │   ├── processed/
-│   └── tca/                     # SQLite TCA
+│   └── tca/                     # SQLite: tca.db, implementation_shortfall.db
 ├── docs/
 │   ├── BLOOMBERG_BLPAPI_DATA_INSTRUCTIONS.md
-│   └── SYSTEM_ARCHITECTURE_AND_VALIDATION.md   # denna fil
+│   ├── SYSTEM_ARCHITECTURE_AND_VALIDATION.md
+│   ├── data1_BLOOMBERG.R        # Prices + FX (session-safe batches)
+│   ├── data2_BLOOMBERG.R        # Fundamentals + Macro (PiT bdh, Dilution)
+│   └── data_CAPITAL_IQ.R        # Supply chain + Debt wall (valfritt)
 ├── research/
-│   ├── 06_marginal_contribution.py   # Shapley-Ablation (ergodisk validering)
-│   └── shapley_results.csv           # Output från 06
+│   ├── 01_ablation_study.py
+│   ├── 02_market_impact.py
+│   ├── 03_statistical_robustness.py
+│   ├── 04_champion_vs_challenger.py
+│   ├── 05_tearsheet_and_benchmarks.py
+│   ├── 06_marginal_contribution.py   # Shapley-Ablation
+│   ├── 07_fragility_and_capacity.py
+│   ├── 08_factor_neutrality.py       # Illiquid decile falsification
+│   ├── _shared.py
+│   └── README.md
 └── test_*.py
 ```
 
