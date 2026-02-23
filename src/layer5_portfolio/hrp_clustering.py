@@ -1,9 +1,12 @@
 """
 Layer 5: Hierarchical Risk Parity (HRP) portfolio allocation.
 López de Prado algorithm: correlation distance, linkage, quasi-diagonalization, recursive bisection.
+FX volatility penalty in distance; currency isolation.
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -11,9 +14,27 @@ import scipy.cluster.hierarchy as sch
 from scipy.spatial.distance import squareform
 
 
-def _correl_dist(corr: pd.DataFrame) -> np.ndarray:
-    """Distance matrix from correlation: d = sqrt((1 - rho) / 2)."""
-    return np.sqrt((1 - corr) / 2).values
+def _correl_dist(
+    corr: pd.DataFrame,
+    fx_vol_penalty: float = 0.0,
+    sek_tickers: Optional[list] = None,
+) -> np.ndarray:
+    """
+    Distance matrix from correlation: d = sqrt((1 - rho) / 2).
+    If fx_vol_penalty > 0 and sek_tickers given: add penalty for pairs involving SEK
+    (FX volatility as straffaktor in avståndsberäkning).
+    """
+    dist = np.sqrt((1 - corr) / 2).values
+    if fx_vol_penalty <= 0 or not sek_tickers:
+        return dist
+    sek_set = set(sek_tickers)
+    labels = corr.index.tolist()
+    for i, li in enumerate(labels):
+        for j, lj in enumerate(labels):
+            if i != j and (li in sek_set or lj in sek_set):
+                dist[i, j] += fx_vol_penalty
+                dist[j, i] += fx_vol_penalty
+    return dist
 
 
 def _get_ivp(cov: pd.DataFrame) -> np.ndarray:
@@ -55,13 +76,17 @@ def _get_rec_bipart(cov: pd.DataFrame, sort_labels: list) -> pd.Series:
     return w
 
 
-def _hrp_weights_for_returns(returns_df: pd.DataFrame) -> pd.Series:
+def _hrp_weights_for_returns(
+    returns_df: pd.DataFrame,
+    fx_vol_penalty: float = 0.0,
+    sek_tickers: Optional[list] = None,
+) -> pd.Series:
     """Run HRP on a single returns block. Returns weights summing to 1.0."""
     if returns_df.empty or len(returns_df.columns) == 0:
         return pd.Series(dtype=float)
     cov = returns_df.cov()
     corr = returns_df.corr()
-    dist = _correl_dist(corr)
+    dist = _correl_dist(corr, fx_vol_penalty, sek_tickers)
     condensed = squareform(dist, checks=False)
     link = sch.linkage(condensed, method="single")
     sort_ix = _get_quasi_diag(link)
@@ -76,14 +101,19 @@ class HierarchicalRiskParity:
     """
     HRP allocation with currency isolation. Split by EUR/SEK, run HRP per group,
     50% capital to each currency bloc, combine to unified weights summing to 1.0.
+    Optional FX volatility penalty in distance for SEK bloc.
     """
 
     def allocate(
-        self, returns_df: pd.DataFrame, currency_series: pd.Series
+        self,
+        returns_df: pd.DataFrame,
+        currency_series: pd.Series,
+        fx_vol_penalty: float = 0.0,
     ) -> pd.Series:
         """
         Compute HRP weights with currency isolation.
         currency_series: ticker -> 'EUR' or 'SEK'. Must cover all columns of returns_df.
+        fx_vol_penalty: Straffaktor for SEK-tickers i avståndsmatrisen (default 0).
         Returns weights summing to 1.0.
         """
         if returns_df.isna().any().any():
@@ -108,7 +138,11 @@ class HierarchicalRiskParity:
 
         if sek_tickers:
             sek_ret = returns_df[sek_tickers]
-            sek_w = _hrp_weights_for_returns(sek_ret)
+            sek_w = _hrp_weights_for_returns(
+                sek_ret,
+                fx_vol_penalty=fx_vol_penalty,
+                sek_tickers=sek_tickers if fx_vol_penalty > 0 else None,
+            )
             weights.loc[sek_tickers] = sek_w.values * 0.5
 
         s = weights.sum()

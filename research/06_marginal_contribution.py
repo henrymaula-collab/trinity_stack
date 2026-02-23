@@ -25,7 +25,11 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from research._shared import (
     GLOBAL_SEED,
+    LOO_COMPONENTS,
     setup_research_data,
+    setup_research_data_with_components,
+    compute_equity_curve,
+    compute_metrics,
     _NeutralNLP,
 )
 from src.engine.backtest_loop import BacktestEngine
@@ -186,6 +190,54 @@ def _neutral_regime(macro_regime_df: pd.DataFrame) -> pd.DataFrame:
     out = macro_regime_df.copy()
     out["regime"] = 1.0
     return out
+
+
+def _compute_turnover(backtest_result: pd.DataFrame) -> float:
+    """
+    Average rebalance turnover: sum(|w_new - w_prev|) per date, averaged.
+    One-sided (gross) turnover.
+    """
+    if backtest_result.empty or len(backtest_result) < 2:
+        return 0.0
+    weight_df = backtest_result.copy()
+    weight_df["date"] = pd.to_datetime(weight_df["date"])
+    dates = sorted(weight_df["date"].unique())
+    prev_weights: Dict[str, float] = {}
+    turnovers = []
+    for rb_date in dates:
+        w_row = weight_df[weight_df["date"] == rb_date]
+        curr = dict(zip(w_row["ticker"], w_row["target_weight"]))
+        all_tickers = set(prev_weights) | set(curr)
+        tot = 0.0
+        for t in all_tickers:
+            w_prev = prev_weights.get(t, 0.0)
+            w_curr = curr.get(t, 0.0)
+            tot += abs(w_curr - w_prev)
+        turnovers.append(tot)
+        prev_weights = curr
+    return float(np.mean(turnovers)) if turnovers else 0.0
+
+
+def _run_backtest_loo(
+    alpha_df: pd.DataFrame,
+    price_returns: pd.DataFrame,
+    macro_regime_df: pd.DataFrame,
+    news_df: pd.DataFrame,
+    rebalance_dates: List[pd.Timestamp],
+    enabled_components: FrozenSet[str],
+    nlp_full: Any,
+) -> pd.DataFrame:
+    """Backtest with LOO component toggles (HMM, HRP). Insider/Meta affect alpha_df upstream."""
+    base = {"NLP_Sentinel", "Vol_Target", "Debt_Wall"}
+    config = set(base)
+    if "HMM_Regime" in enabled_components:
+        config.add("HMM_Regime")
+    if "HRP_Clustering" in enabled_components:
+        config.add("HRP_Clustering")
+    return _run_backtest(
+        alpha_df, price_returns, macro_regime_df, news_df, rebalance_dates,
+        frozenset(config), nlp_full,
+    )
 
 
 def _geometric_growth(returns: pd.Series) -> float:
@@ -565,5 +617,132 @@ def run_shapley_ablation() -> pd.DataFrame:
     return summary_df
 
 
+# --- Leave-One-Out Marginal Contribution ---
+LOO_COMPONENT_NAMES = ["Insider", "Meta_Labeling", "HMM_Regime", "HRP_Clustering"]
+MARGINAL_SHARPE_PCT_THRESHOLD = 5.0  # Falsification: <5% Sharpe contribution → disable
+
+
+def run_loo_marginal_contribution() -> pd.DataFrame:
+    """
+    Leave-One-Out backtest: isolate effect of Insider, Meta_Labeling, HMM_Regime, HRP_Clustering.
+    Compute marginal delta in Sharpe, Max DD, turnover. Apply falsification rule.
+    """
+    print("LOO Marginal Contribution: Loading data...")
+    try:
+        nlp_full = NLPSentinel()
+    except Exception:
+        print("WARNING: NLPSentinel init failed. Using NeutralNLP.")
+        nlp_full = _NeutralNLP()
+
+    full_enabled = frozenset(LOO_COMPONENT_NAMES)
+    alpha_full, price_returns, macro_regime_df, news_df, raw_prices, rebalance_dates = (
+        setup_research_data_with_components(full_enabled)
+    )
+
+    bt_full = _run_backtest_loo(
+        alpha_full, price_returns, macro_regime_df, news_df, rebalance_dates,
+        full_enabled, nlp_full,
+    )
+    ret_full = _strategy_returns(bt_full, price_returns)
+    equity_full = compute_equity_curve(bt_full, price_returns)
+    met_full = compute_metrics(equity_full)
+    sharpe_full = met_full["sharpe"] if not np.isnan(met_full["sharpe"]) else 0.0
+    max_dd_full = met_full["max_dd"] if not np.isnan(met_full["max_dd"]) else 0.0
+    turnover_full = _compute_turnover(bt_full)
+
+    configs: Dict[str, Dict[str, float]] = {
+        "Full": {
+            "sharpe": sharpe_full,
+            "max_dd": max_dd_full,
+            "turnover": turnover_full,
+        }
+    }
+
+    for excluded in LOO_COMPONENT_NAMES:
+        enabled = full_enabled - {excluded}
+        alpha_df, _, _, _, _, _ = setup_research_data_with_components(enabled)
+        bt = _run_backtest_loo(
+            alpha_df, price_returns, macro_regime_df, news_df, rebalance_dates,
+            enabled, nlp_full,
+        )
+        ret = _strategy_returns(bt, price_returns)
+        equity = compute_equity_curve(bt, price_returns)
+        met = compute_metrics(equity)
+        sharpe = met["sharpe"] if not np.isnan(met["sharpe"]) else 0.0
+        max_dd = met["max_dd"] if not np.isnan(met["max_dd"]) else 0.0
+        turnover = _compute_turnover(bt)
+        configs[f"Without_{excluded}"] = {"sharpe": sharpe, "max_dd": max_dd, "turnover": turnover}
+
+    rows = []
+    disabled_recommend: List[str] = []
+    for comp in LOO_COMPONENT_NAMES:
+        key = f"Without_{comp}"
+        s_full = configs["Full"]["sharpe"]
+        s_wo = configs[key]["sharpe"]
+        dd_full = configs["Full"]["max_dd"]
+        dd_wo = configs[key]["max_dd"]
+        to_full = configs["Full"]["turnover"]
+        to_wo = configs[key]["turnover"]
+
+        delta_sharpe = s_full - s_wo
+        delta_dd = dd_full - dd_wo
+        delta_turnover = turnover_full - configs[key]["turnover"]
+
+        sharpe_pct = 100.0 * (delta_sharpe / abs(s_full)) if abs(s_full) > 1e-12 else 0.0
+        cannibalizes = s_wo > s_full
+
+        verdict = "KEEP"
+        if sharpe_pct < MARGINAL_SHARPE_PCT_THRESHOLD and sharpe_pct >= 0:
+            verdict = "DISABLE (<5% Sharpe contribution)"
+            disabled_recommend.append(comp)
+        elif cannibalizes:
+            verdict = "DISABLE (cannibalizes alpha)"
+            disabled_recommend.append(comp)
+
+        rows.append({
+            "Component": comp,
+            "Sharpe_Full": s_full,
+            "Sharpe_Without": s_wo,
+            "Delta_Sharpe": delta_sharpe,
+            "Sharpe_Contribution_Pct": sharpe_pct,
+            "MaxDD_Full": dd_full,
+            "MaxDD_Without": dd_wo,
+            "Delta_MaxDD": delta_dd,
+            "Turnover_Full": to_full,
+            "Turnover_Without": to_wo,
+            "Delta_Turnover": delta_turnover,
+            "Cannibalizes": cannibalizes,
+            "VERDICT": verdict,
+        })
+
+    report_df = pd.DataFrame(rows)
+    print("\n" + "=" * 100)
+    print("LOO MARGINAL CONTRIBUTION: Signal Interaction Evaluation")
+    print("=" * 100)
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", 120)
+    print(report_df.to_string(index=False))
+    print("\n--- Falsification Rule: Components to programmatically disable ---")
+    if disabled_recommend:
+        for c in disabled_recommend:
+            print(f"  {c}: DISABLE")
+    else:
+        print("  None (all components pass)")
+    print(f"\nThreshold: marginal Sharpe contribution < {MARGINAL_SHARPE_PCT_THRESHOLD}% → disable")
+    print("Cannibalization: Sharpe(without X) > Sharpe(full) → disable X")
+
+    out_path = _PROJECT_ROOT / "research" / "loo_marginal_contribution.csv"
+    report_df.to_csv(out_path, index=False)
+    print(f"\nSaved to {out_path}")
+    return report_df
+
+
 if __name__ == "__main__":
-    run_shapley_ablation()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--loo", action="store_true", help="Run LOO marginal contribution (default: Shapley ablation)")
+    args = parser.parse_args()
+    if args.loo:
+        run_loo_marginal_contribution()
+    else:
+        run_shapley_ablation()

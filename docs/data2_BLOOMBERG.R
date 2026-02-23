@@ -5,7 +5,8 @@
 # Output: fundamentals.parquet, macro.parquet, news.parquet (om tillgänglig)
 #
 # Krav: Bloomberg Terminal igång; TICKERS från data1 (nordic_historical_universe.csv)
-#       eller PiT-universum via get_historical_universe
+#       Exakt samma PiT-universum som data1 — inkl. avlistade bolag.
+#       ENDAST bdh() (tidsserier) — ALDRIG bdp() (snapshot).
 # =============================================================================
 
 library(Rblpapi)
@@ -20,23 +21,27 @@ END_DATE <- as.Date("2026-12-31")
 FUND_BATCH_SIZE <- 50L
 UNIVERSE_CACHE <- file.path(OUTPUT_DIR, "nordic_historical_universe.csv")
 
-# Läs TICKERS från data1s cache (kör data1 först) eller fallback till manuell lista
-if (file.exists(UNIVERSE_CACHE)) {
-  TICKERS <- read.csv(UNIVERSE_CACHE, stringsAsFactors = FALSE)$ticker
-  cat(sprintf("Universum från data1: %d tickers\n", length(TICKERS)))
-} else {
-  TICKERS <- c("NOKIA FH Equity", "UPM FH Equity", "ORNBV FH Equity",
-               "VOLV-B SS Equity", "ERIC-B SS Equity", "ATCO-A SS Equity")
-  cat("Varning: nordic_historical_universe.csv saknas. Kör data1 först. Använder fallback-lista.\n")
+# PiT-universum: MÅSTE matcha data1 (inkl. avlistade)
+if (!file.exists(UNIVERSE_CACHE)) {
+  stop("nordic_historical_universe.csv saknas. Kör data1_BLOOMBERG.R först.", call. = FALSE)
 }
+TICKERS_RAW <- read.csv(UNIVERSE_CACHE, stringsAsFactors = FALSE)$ticker
+TICKERS <- if (all(grepl(" Equity$", TICKERS_RAW))) TICKERS_RAW else paste(trimws(TICKERS_RAW), "Equity")
+cat(sprintf("PiT-universum från data1: %d tickers (inkl. avlistade)\n", length(TICKERS)))
 
 # ---- Anslut Bloomberg ----
 blpConnect(host = "localhost", port = 8194L)
 
 # =============================================================================
-# 1. FUNDAMENTALS (batchad för stort universum)
+# 1. FUNDAMENTALS — ENDAST bdh() (Point-in-Time tidsserier)
 # =============================================================================
-cat("Hämtar fundamentals...\n")
+# Reporting Lag: FUND_PER=T, IS_POINT_IN_TIME=Y kräver vissa licenser.
+# Om override ger fel → ta bort från FUND_OVERRIDES.
+FUND_OVERRIDES <- c(
+  FUND_PER = "T"           # Fiscal Period = true (rätt rapporteringsdatum)
+  # IS_POINT_IN_TIME = "Y" # PiT-data — aktivera om licens tillåter
+)
+opt_quarterly <- c(periodicitySelection = "QUARTERLY")
 
 fund_fields <- c(
   "EARN_ANN_DT_TIME_HIST_WITH_EPS",
@@ -45,13 +50,19 @@ fund_fields <- c(
   "RETURN_ON_INVESTED_CAPITAL",
   "EQY_SH_OUT",
   "ACCRUAL_RATIO",
-  "BEST_DIV_YLD",    # Uppskattning; gles för nordiska småbolag utan analytikertäckning
-  "DIVIDEND_YIELD",  # Historisk/trailing; fallback när BEST_DIV_YLD saknas
-  "CUR_MKT_CAP"      # Marknadsvärde; använd aldrig PX_VOLUME för värdering
+  "BEST_DIV_YLD",
+  "DIVIDEND_YIELD",
+  "CUR_MKT_CAP"
 )
-opt <- c(periodicitySelection = "QUARTERLY")
+cat("Hämtar fundamentals (bdh tidsserier)...\n")
 
-# ---- Tracker: Hoppa över Success ----
+ensure_columns <- function(df, required_cols) {
+  for (col in required_cols) {
+    if (!col %in% names(df)) df[[col]] <- NA_real_
+  }
+  df
+}
+
 FUND_STATUS_LOG <- file.path(OUTPUT_DIR, "fundamentals_status_log.csv")
 if (file.exists(FUND_STATUS_LOG)) {
   fund_status <- read.csv(FUND_STATUS_LOG, stringsAsFactors = FALSE)
@@ -66,17 +77,26 @@ if (file.exists(FUND_STATUS_LOG)) {
 fund_list <- list()
 for (ticker in TICKERS_PENDING) {
   res <- tryCatch({
-    df <- bdh(ticker, fund_fields, START_DATE, END_DATE, options = opt)
+    df <- bdh(ticker, fund_fields, START_DATE, END_DATE, options = opt_quarterly, overrides = FUND_OVERRIDES)
     if (is.null(df) || nrow(df) == 0) {
       list(status = "Failed", data = NULL)
     } else {
+      df <- ensure_columns(df, fund_fields)
       df$ticker <- gsub(" Equity$", "", ticker)
       list(status = "Success", data = df)
     }
   }, error = function(e) {
-    list(status = "Failed", data = NULL)
+    tryCatch({
+      df <- bdh(ticker, fund_fields, START_DATE, END_DATE, options = opt_quarterly)
+      if (is.null(df) || nrow(df) == 0) {
+        list(status = "Failed", data = NULL)
+      } else {
+        df <- ensure_columns(df, fund_fields)
+        df$ticker <- gsub(" Equity$", "", ticker)
+        list(status = "Success", data = df)
+      }
+    }, error = function(e2) list(status = "Failed", data = NULL))
   })
-  # Uppdatera tracker-loggen utan att skapa dubbletter
   idx <- which(fund_status$Ticker == ticker)
   if (length(idx) > 0) {
     fund_status$Status[idx] <- res$status
@@ -91,12 +111,12 @@ write.csv(fund_status, FUND_STATUS_LOG, row.names = FALSE)
 fund_list_valid <- fund_list[!sapply(fund_list, is.null)]
 fund_path <- file.path(OUTPUT_DIR, "fundamentals.parquet")
 fundamentals_new <- if (length(fund_list_valid) > 0) bind_rows(fund_list_valid) else NULL
+TICKERS_PENDING_CLEAN <- gsub(" Equity$", "", TICKERS_PENDING)
 if (!is.null(fundamentals_new) && file.exists(fund_path)) {
   fund_existing <- read_parquet(fund_path)
   ticker_col <- if ("ticker" %in% names(fund_existing)) "ticker" else "Ticker"
-  # Säker filtrering för att undvika dubbletter vid uppdatering
   fund_existing <- fund_existing %>%
-    filter(!(!!sym(ticker_col) %in% TICKERS_PENDING))
+    filter(!(!!sym(ticker_col) %in% TICKERS_PENDING_CLEAN))
   fundamentals_raw <- bind_rows(fund_existing, fundamentals_new)
 } else if (!is.null(fundamentals_new)) {
   fundamentals_raw <- fundamentals_new
@@ -106,7 +126,7 @@ if (!is.null(fundamentals_new) && file.exists(fund_path)) {
   stop("Inga fundamentals hämtade och ingen befintlig fil.", call. = FALSE)
 }
 
-# Namngivning för Trinity
+# Namngivning + Dilution (rullande 1-år) för Trinity
 if (nrow(fundamentals_raw) > 0) {
   fundamentals_df <- fundamentals_raw
   if ("date" %in% names(fundamentals_df) && !"report_date" %in% names(fundamentals_df)) {
@@ -119,11 +139,7 @@ if (nrow(fundamentals_raw) > 0) {
       fundamentals_df <- fundamentals_df %>% rename(!!nn := !!sym(renames[[nn]]))
     }
   }
-  # CONSENSUS_EPS: fallback = EPS t-4 (beräknas i preprocess)
-  if (!"CONSENSUS_EPS" %in% names(fundamentals_df)) {
-    fundamentals_df$CONSENSUS_EPS <- NA_real_
-  }
-  # Vektoriserad och säker coalesce-logik för utdelningar
+  if (!"CONSENSUS_EPS" %in% names(fundamentals_df)) fundamentals_df$CONSENSUS_EPS <- NA_real_
   if (!"BEST_DIV_YLD" %in% names(fundamentals_df)) fundamentals_df$BEST_DIV_YLD <- NA_real_
   if (!"DIVIDEND_YIELD" %in% names(fundamentals_df)) fundamentals_df$DIVIDEND_YIELD <- NA_real_
   fundamentals_df <- fundamentals_df %>%
@@ -134,11 +150,29 @@ if (nrow(fundamentals_raw) > 0) {
   } else {
     fundamentals_df$Market_Cap <- NA_real_
   }
+  # Dilution: rullande 1-års utspädning. Kvartalsdata: lag 4 = 1 år.
+  # Formel: Dilution = EQY_SH_OUT_t / lag(EQY_SH_OUT, 4) - 1
+  if ("EQY_SH_OUT" %in% names(fundamentals_df)) {
+    fundamentals_df <- fundamentals_df %>%
+      group_by(ticker) %>%
+      arrange(report_date, .by_group = TRUE) %>%
+      mutate(
+        EQY_SH_OUT = as.numeric(EQY_SH_OUT),
+        Dilution = ifelse(
+          dplyr::lag(EQY_SH_OUT, 4) > 0 & is.finite(dplyr::lag(EQY_SH_OUT, 4)),
+          (EQY_SH_OUT / dplyr::lag(EQY_SH_OUT, 4)) - 1,
+          NA_real_
+        )
+      ) %>%
+      ungroup()
+  } else {
+    fundamentals_df$Dilution <- NA_real_
+  }
   fundamentals_df <- fundamentals_df %>%
     select(report_date, ticker, ACTUAL_EPS, CONSENSUS_EPS, EPS_STD, ROIC,
-           EQY_SH_OUT, Dividend_Yield, Market_Cap, Accruals, everything())
+           Dilution, EQY_SH_OUT, Dividend_Yield, Market_Cap, Accruals, everything())
   write_parquet(fundamentals_df, file.path(OUTPUT_DIR, "fundamentals.parquet"))
-  cat(sprintf("Fundamentals: %d rader\n", nrow(fundamentals_df)))
+  cat(sprintf("Fundamentals: %d rader (Dilution beräknad från EQY_SH_OUT lag 4)\n", nrow(fundamentals_df)))
 } else {
   cat("Inga fundamentals hämtade. Skapa placeholder eller kontrollera tickers.\n")
 }

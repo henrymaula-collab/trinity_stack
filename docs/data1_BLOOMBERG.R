@@ -84,6 +84,16 @@ OVERRIDES <- c(
 # PX_LAST i illikvida småbolag är brusigt/manipulerbart i slutauktion; VWAP ger empiriskt underlag för Market Impact.
 FIELDS <- c("PX_OPEN", "PX_LAST", "PX_HIGH", "PX_LOW", "PX_TURN_OVER", "PX_BID", "PX_ASK", "VWAP_CP")
 
+# ---- Säkerhetsfunktion: Rblpapi kan utelämna kolumner för vissa tickers ----
+ensure_columns <- function(df, required_cols) {
+  for (col in required_cols) {
+    if (!col %in% names(df)) {
+      df[[col]] <- NA_real_
+    }
+  }
+  df
+}
+
 # ---- Tracker: Läs status_log, hoppa över Success ----
 STATUS_LOG <- file.path(OUTPUT_DIR, "status_log.csv")
 if (file.exists(STATUS_LOG)) {
@@ -99,6 +109,7 @@ if (file.exists(STATUS_LOG)) {
 # ---- 1. Hämta priser (iterativ batching, checkpoint, robust felhantering) ----
 all_batch_paths <- character(0)
 if (length(TICKERS_PENDING) > 0) {
+  session_id <- format(Sys.time(), "%Y%m%d_%H%M%S")
   batches <- split(TICKERS_PENDING, ceiling(seq_along(TICKERS_PENDING) / BDH_BATCH_SIZE))
   for (b in seq_along(batches)) {
     chunk <- batches[[b]]
@@ -118,6 +129,7 @@ if (length(TICKERS_PENDING) > 0) {
         if (is.null(df) || nrow(df) == 0) {
           list(status = "Failed", data = NULL)
         } else {
+          df <- ensure_columns(df, FIELDS)
           df$ticker <- gsub(" Equity$", "", ticker)
           list(status = "Success", data = df)
         }
@@ -134,7 +146,7 @@ if (length(TICKERS_PENDING) > 0) {
     }
     if (length(batch_data) > 0) {
       batch_df <- bind_rows(batch_data)
-      batch_path <- file.path(OUTPUT_DIR, sprintf("prices_batch_%d.parquet", b))
+      batch_path <- file.path(OUTPUT_DIR, sprintf("prices_batch_%s_%d.parquet", session_id, b))
       write_parquet(batch_df, batch_path)
       all_batch_paths <- c(all_batch_paths, batch_path)
     }
@@ -150,6 +162,7 @@ if (length(batch_files) > 0) {
   stop("Inga prismatalogar (batchar) tillgängliga.", call. = FALSE)
 }
 if (!"ticker" %in% names(prices_df)) prices_df$ticker <- character(0)
+prices_df <- ensure_columns(prices_df, FIELDS)
 
 # Ticker rensat direkt — undvik join-fel mot fundamentals
 SEK_TICKERS_CLEAN <- gsub(" Equity$", "", SEK_TICKERS)
@@ -179,12 +192,19 @@ fx_df$date <- as.Date(fx_df$date)
 dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 write_parquet(as.data.frame(fx_df), file.path(OUTPUT_DIR, "fx_sekeur.parquet"))
 
-# ---- 3. Konvertera SEK → EUR för Stockholm-tickers ----
+# ---- 3. Konvertera SEK → EUR för Stockholm-tickers (säker vid saknad FX) ----
 prices_df$is_sek <- prices_df$ticker %in% SEK_TICKERS_CLEAN
 prices_df <- prices_df %>% left_join(
   fx_df %>% rename(sekeur_rate = sekeur),
   by = "date"
 )
+n_sek_na_fx <- sum(prices_df$is_sek & (is.na(prices_df$sekeur_rate) | prices_df$sekeur_rate <= 0), na.rm = TRUE)
+if (n_sek_na_fx > 0) {
+  warning(sprintf(
+    "SEK-tickers utan valutakurs: %d rader behåller originalpriser (ej konverterade till EUR). Kontrollera fx_df och datumspann.",
+    n_sek_na_fx
+  ))
+}
 price_cols <- c("PX_OPEN", "PX_LAST", "PX_HIGH", "PX_LOW", "PX_TURN_OVER", "PX_BID", "PX_ASK", "VWAP_CP")
 for (col in price_cols) {
   if (col %in% names(prices_df)) {
@@ -198,11 +218,13 @@ for (col in price_cols) {
 }
 prices_df$is_sek <- prices_df$sekeur_rate <- NULL
 
-# ---- 4. Beräkna BID_ASK_SPREAD_PCT ----
-prices_df$PX_MID <- (as.numeric(prices_df$PX_BID) + as.numeric(prices_df$PX_ASK)) / 2
+# ---- 4. Beräkna BID_ASK_SPREAD_PCT (säkert vid helt NA PX_BID/PX_ASK) ----
+bid <- as.numeric(prices_df$PX_BID)
+ask <- as.numeric(prices_df$PX_ASK)
+prices_df$PX_MID <- (bid + ask) / 2
 prices_df$BID_ASK_SPREAD_PCT <- ifelse(
-  prices_df$PX_MID > 0,
-  100 * (as.numeric(prices_df$PX_ASK) - as.numeric(prices_df$PX_BID)) / prices_df$PX_MID,
+  is.finite(prices_df$PX_MID) & prices_df$PX_MID > 0,
+  100 * (ask - bid) / prices_df$PX_MID,
   NA_real_
 )
 prices_df$PX_MID <- NULL

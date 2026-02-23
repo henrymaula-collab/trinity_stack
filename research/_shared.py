@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -40,7 +40,9 @@ def _load_parquet_or_mock(name: str) -> pd.DataFrame:
                 base_px = max(1.0, base_px * (1 + ret))
                 records.append({
                     "date": pd.Timestamp(d), "ticker": f"T_{t:02d}",
-                    "PX_LAST": base_px, "PX_TURN_OVER": max(1000.0, float(np.random.lognormal(12, 1))),
+                    "PX_LAST": base_px,
+                    "VWAP_CP": base_px * (1.0 + np.random.uniform(-0.002, 0.002)),
+                    "PX_TURN_OVER": max(1000.0, float(np.random.lognormal(12, 1))),
                     "BID_ASK_SPREAD_PCT": np.random.uniform(0.005, 0.04),
                 })
         return pd.DataFrame(records)
@@ -75,7 +77,30 @@ def _load_parquet_or_mock(name: str) -> pd.DataFrame:
                 "text": "Neutral update.",
             })
         return pd.DataFrame(records)
+    if name == "insider":
+        # Mock insider for research (disclosure_date, ticker, transaction_value, insider_id)
+        records = []
+        for _ in range(30):
+            records.append({
+                "disclosure_date": np.random.choice(dates),
+                "ticker": f"T_{np.random.randint(0, n_tickers):02d}",
+                "transaction_value": float(np.random.lognormal(10, 2)),
+                "insider_id": f"ID_{np.random.randint(0, 5)}",
+            })
+        return pd.DataFrame(records)
     raise ValueError(f"Unknown data name: {name}")
+
+
+def _load_insider_or_mock() -> Optional[pd.DataFrame]:
+    """Load insider data if parquet exists; else mock for research (LOO path)."""
+    path = DATA_RAW / "insider.parquet"
+    if path.exists():
+        df = pd.read_parquet(path)
+        return df if not df.empty else None
+    try:
+        return _load_parquet_or_mock("insider")
+    except ValueError:
+        return None
 
 
 def _research_load_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -90,12 +115,20 @@ def _research_load_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.
 
 
 def _build_price_returns_wide(raw_prices: pd.DataFrame) -> pd.DataFrame:
-    px = raw_prices.copy()
+    """VWAP-based returns when available; stale/toxic → ret=NaN."""
+    from src.layer1_data.feature_engineering import apply_stale_price_handling
+
+    px = apply_stale_price_handling(raw_prices)
     px["date"] = pd.to_datetime(px["date"])
     px = px.sort_values(["ticker", "date"])
-    px["ret"] = px.groupby("ticker")["PX_LAST"].pct_change()
+    if "VWAP_CP" in px.columns:
+        px["ret"] = px.groupby("ticker")["VWAP_CP"].pct_change()
+        px.loc[px["toxic_print_day"], "ret"] = np.nan
+    else:
+        px["ret"] = px.groupby("ticker")["PX_LAST"].pct_change()
+    px.loc[px["is_stale_price"], "ret"] = np.nan
     wide = px.pivot_table(index="date", columns="ticker", values="ret")
-    wide = wide.dropna(how="all").dropna(how="any")
+    wide = wide.dropna(how="all")
     if wide.empty:
         raise ValueError("price_df (returns) is empty after dropping NaNs")
     return wide
@@ -181,6 +214,98 @@ def setup_research_data() -> Tuple[
     merged["signal_mom"] = merged["signal_mom"].fillna(0.5)
     merged["signal_lgbm"] = merged["signal_lgbm"].fillna(0.5)
     alpha_df = alpha_ensemble.fit_transform(merged)
+
+    price_returns = _build_price_returns_wide(raw_prices)
+    rebalance_dates = pd.date_range(
+        price_returns.index.min() + pd.Timedelta(days=300),
+        price_returns.index.max(),
+        freq="BME",
+    ).tolist()
+
+    return alpha_df, price_returns, macro_regime_df, news_df, raw_prices, rebalance_dates
+
+
+LOO_COMPONENTS = frozenset({"Insider", "Meta_Labeling", "HMM_Regime", "HRP_Clustering"})
+
+
+def setup_research_data_with_components(
+    enabled_components: FrozenSet[str],
+) -> Tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    List[pd.Timestamp],
+]:
+    """
+    Build alpha and data with component toggles for LOO marginal contribution.
+    enabled_components: subset of LOO_COMPONENTS.
+    - Insider: include insider_cluster_signal in features (else None)
+    - Meta_Labeling: multiply alpha_score by meta P(profitable)
+    - HMM_Regime, HRP_Clustering: applied in backtest only (no effect here)
+    """
+    use_insider = "Insider" in enabled_components
+    use_meta = "Meta_Labeling" in enabled_components
+
+    raw_prices, raw_fundamentals, macro_df, news_df = _research_load_data()
+    macro_detector = MacroRegimeDetector(random_state=GLOBAL_SEED)
+    macro_regime_df = _build_macro_regime_series(macro_df, macro_detector)
+
+    insider_df = _load_insider_or_mock() if use_insider else None
+    features_df = feature_engineer.build_features(
+        raw_prices, raw_fundamentals, macro_df=macro_df, insider_df=insider_df
+    )
+
+    momentum_gen = MomentumGenerator()
+    lgbm_gen = LightGBMGenerator()
+    alpha_ensemble = AlphaEnsemble()
+
+    signal_mom = momentum_gen.generate(raw_prices)
+    lgbm_gen.train_walk_forward(features_df, target_col="forward_return")
+    signal_lgbm = lgbm_gen.predict(features_df)
+
+    merged = features_df.drop(columns=["signal_mom", "signal_lgbm"], errors="ignore").merge(
+        signal_mom.rename("signal_mom"),
+        left_on=["date", "ticker"],
+        right_index=True,
+        how="left",
+    )
+    merged = merged.merge(
+        signal_lgbm.rename("signal_lgbm"),
+        left_on=["date", "ticker"],
+        right_index=True,
+        how="left",
+    )
+    merged["signal_mom"] = merged["signal_mom"].fillna(0.5)
+    merged["signal_lgbm"] = merged["signal_lgbm"].fillna(0.5)
+    alpha_df = alpha_ensemble.fit_transform(merged)
+
+    if use_meta:
+        try:
+            from src.layer3_alpha.signal_generators import MetaLabeler
+
+            meta = MetaLabeler(random_state=GLOBAL_SEED)
+            meta.train(
+                features_df,
+                raw_prices,
+                macro_regime_df,
+                primary_forward_return_horizon=1,
+            )
+            proba = meta.predict_proba(merged)
+            meta_df = merged[["date", "ticker"]].copy()
+            meta_df["meta_proba"] = proba.reindex(merged.index).fillna(0.5).values
+            alpha_df = alpha_df.merge(
+                meta_df.drop_duplicates(subset=["date", "ticker"]),
+                on=["date", "ticker"],
+                how="left",
+            )
+            alpha_df["alpha_score"] = (
+                alpha_df["alpha_score"] * alpha_df["meta_proba"].fillna(0.5)
+            )
+            alpha_df = alpha_df.drop(columns=["meta_proba"], errors="ignore")
+        except Exception:
+            pass  # Meta fail: keep alpha as-is
 
     price_returns = _build_price_returns_wide(raw_prices)
     rebalance_dates = pd.date_range(

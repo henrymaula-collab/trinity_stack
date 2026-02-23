@@ -7,6 +7,9 @@ Modules:
 3. Jitter & fragility: data lag +2d, 1% noise injection
 4. Liquidity freeze: spread 3×, volume -70%, time-to-exit for 500k EUR
 5. Drawdown-constrained Kelly: f* s.t. P(DD > 25%) < 0.01
+6. Kill-switches & Crisis stress-test: GFC 2008, Covid 2020, Räntechocken 2022
+7. Falsification Report: PBO, DSR, crisis significance, binary Pass/Fail
+8. Regime-Agnostic Stress Test: HMM disabled → FX/VolTarget static; Sharpe<0 or DD>25% → REGIME_FRAGILITY_DETECTED
 
 Does not modify src/ or run_pipeline.py.
 """
@@ -32,6 +35,7 @@ from research._shared import (
 )
 from research._shared import _NeutralNLP
 from src.engine.backtest_loop import BacktestEngine
+from src.layer3_alpha.cpcv import run_cpcv, make_returns_evaluate_fn
 from src.layer5_portfolio.hrp_clustering import HierarchicalRiskParity
 from src.layer5_portfolio.dynamic_vol_target import DynamicVolTargeting
 
@@ -56,6 +60,41 @@ DRAWDOWN_25PCT_TARGET_PROB = 0.01
 DRAWDOWN_SIM_PATHS = 5000
 KELLY_SHRINKAGE = 0.5
 KELLY_SAFETY = 0.3
+
+# Kill-switch thresholds
+DSR_MIN_THRESHOLD = 1.25
+PBO_FAIL_THRESHOLD = 0.20  # PBO > 20% → Fail
+STRESS_WINDOWS = [
+    ("GFC_2008", "2008-01-01", "2008-12-31"),
+    ("Euro_2011", "2011-01-01", "2011-12-31"),
+    ("Covid_2020", "2020-01-01", "2020-12-31"),
+    ("Bear_2022", "2022-01-01", "2022-12-31"),
+]
+CAPACITY_LIMIT_REQUIRED = "CAPACITY_LIMIT_REQUIRED"
+REGIME_FRAGILITY_DETECTED = "REGIME_FRAGILITY_DETECTED"
+REGIME_DD_FAIL_THRESHOLD = 0.25  # Max DD > 25% when HMM off → fragility
+
+
+# ---------------------------------------------------------------------------
+# 0. Crisis stress backtest & strategy metrics
+# ---------------------------------------------------------------------------
+
+
+def _neutral_regime(macro_regime_df: pd.DataFrame) -> pd.DataFrame:
+    """Disable HMM: regime = 1.0 (Risk-On) for all dates. FX/VolTarget → static defaults."""
+    out = macro_regime_df.copy()
+    out["regime"] = 1.0
+    return out
+
+
+def _sharpe_in_window(returns: pd.Series, start: str, end: str) -> float:
+    """Annualized Sharpe for returns in [start, end]. Returns np.nan if insufficient data."""
+    idx = pd.to_datetime(returns.index)
+    mask = (idx >= start) & (idx <= end)
+    sub = returns.loc[mask].dropna()
+    if len(sub) < 5 or sub.std() < 1e-12:
+        return np.nan
+    return float((sub.mean() / sub.std()) * np.sqrt(252))
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +528,222 @@ def drawdown_constrained_kelly(
 
 
 # ---------------------------------------------------------------------------
+# 6. Crisis stress backtests & Kill-switches
+# ---------------------------------------------------------------------------
+
+
+def run_crisis_stress_backtests(
+    strategy_returns: pd.Series,
+) -> Dict[str, Any]:
+    """
+    Backtest exclusively during historical stress periods.
+    Kill-switch 1: If net Sharpe < 0 in any stress period → CAPACITY_LIMIT_REQUIRED.
+    """
+    results: Dict[str, Any] = {"windows": {}, "capacity_limit_required": False}
+    for name, start, end in STRESS_WINDOWS:
+        sharpe = _sharpe_in_window(strategy_returns, start, end)
+        n_obs = len(
+            strategy_returns.loc[
+                (pd.to_datetime(strategy_returns.index) >= start)
+                & (pd.to_datetime(strategy_returns.index) <= end)
+            ].dropna()
+        )
+        results["windows"][name] = {"sharpe": sharpe, "n_obs": n_obs}
+        if np.isfinite(sharpe) and sharpe < 0 and n_obs >= 5:
+            results["capacity_limit_required"] = True
+    return results
+
+
+def run_dsr_evaluation(
+    strategy_returns: pd.Series,
+) -> Dict[str, Any]:
+    """
+    CPCV-based Deflated Sharpe Ratio.
+    Kill-switch 2: DSR < 1.25 → block approval.
+    """
+    ret_arr = strategy_returns.sort_index().dropna().values
+    n = len(ret_arr)
+    if n < 50:
+        return {
+            "dsr": np.nan,
+            "pbo": np.nan,
+            "sharpe_median": np.nan,
+            "cpcv_ok": False,
+            "dsr_pass": False,
+        }
+    n_seg = min(16, max(8, n // 10))
+    n_test = max(2, n_seg // 4)
+    try:
+        eval_fn = make_returns_evaluate_fn(ret_arr)
+        result = run_cpcv(
+            eval_fn,
+            n_samples=n,
+            forward_return_horizon=1,
+            n_segments=n_seg,
+            n_test_segments=n_test,
+            n_paths_min=min(200, 500),
+        )
+        dsr_pass = np.isfinite(result.dsr) and result.dsr >= DSR_MIN_THRESHOLD
+        return {
+            "dsr": result.dsr,
+            "pbo": result.pbo,
+            "sharpe_median": result.sharpe_median,
+            "pbo_allocatable": result.is_allocatable,
+            "cpcv_ok": True,
+            "dsr_pass": dsr_pass,
+        }
+    except Exception as e:
+        return {
+            "dsr": np.nan,
+            "pbo": np.nan,
+            "sharpe_median": np.nan,
+            "cpcv_ok": False,
+            "dsr_pass": False,
+            "error": str(e),
+        }
+
+
+def _risk_factor_significance_check(
+    strategy_returns: pd.Series,
+) -> Tuple[bool, str]:
+    """
+    Placeholder: require strategy return to be significantly positive (t-test).
+    Full factor neutrality evaluation in 08_factor_neutrality.py.
+    """
+    r = strategy_returns.dropna()
+    if len(r) < 30:
+        return False, "insufficient_obs"
+    from scipy import stats
+    t_stat, p_val = stats.ttest_1samp(r, 0)
+    # One-sided: mean > 0
+    significant = r.mean() > 0 and p_val < 0.05
+    return significant, f"t={t_stat:.2f}, p={p_val:.4f}"
+
+
+# ---------------------------------------------------------------------------
+# 8. Regime-Agnostic Stress Test (Model Independence)
+# ---------------------------------------------------------------------------
+
+
+def run_regime_agnostic_stress_test(
+    alpha_df: pd.DataFrame,
+    price_returns: pd.DataFrame,
+    macro_regime_df: pd.DataFrame,
+    news_df: pd.DataFrame,
+    rebalance_dates: List[pd.Timestamp],
+) -> Dict[str, Any]:
+    """
+    Parallel backtest with HMM disabled (neutral regime).
+    FX-hedging and Volatility Targeting forced to static default modes.
+    Falsification: Sharpe<0 or MaxDD>25% when HMM off → REGIME_FRAGILITY_DETECTED.
+    """
+    neutral_macro = _neutral_regime(macro_regime_df)
+    engine = BacktestEngine(
+        alpha_model=None,
+        nlp_sentinel=_NeutralNLP(),
+        hrp_model=HierarchicalRiskParity(),
+        vol_targeter=DynamicVolTargeting(),
+    )
+
+    bt_hmm_on = engine.run_backtest(
+        price_df=price_returns,
+        alpha_df=alpha_df,
+        macro_df=macro_regime_df,
+        news_df=news_df,
+        rebalance_dates=rebalance_dates,
+        currency_series=None,
+    )
+    bt_hmm_off = engine.run_backtest(
+        price_df=price_returns,
+        alpha_df=alpha_df,
+        macro_df=neutral_macro,
+        news_df=news_df,
+        rebalance_dates=rebalance_dates,
+        currency_series=None,
+    )
+
+    eq_on = compute_equity_curve(bt_hmm_on, price_returns)
+    eq_off = compute_equity_curve(bt_hmm_off, price_returns)
+    ret_on = eq_on.pct_change().dropna()
+    ret_off = eq_off.pct_change().dropna()
+
+    met_on = compute_metrics(eq_on)
+    met_off = compute_metrics(eq_off)
+
+    crisis_sharpes: Dict[str, float] = {}
+    for name, start, end in STRESS_WINDOWS:
+        sh = _sharpe_in_window(ret_off, start, end)
+        crisis_sharpes[name] = sh
+
+    sharpe_off = met_off.get("sharpe", np.nan)
+    max_dd_off = met_off.get("max_dd", np.nan)
+    max_dd_pct = abs(max_dd_off) if np.isfinite(max_dd_off) else 0.0
+
+    regime_fragility = (
+        (np.isfinite(sharpe_off) and sharpe_off < 0)
+        or (np.isfinite(max_dd_off) and max_dd_pct > REGIME_DD_FAIL_THRESHOLD)
+    )
+
+    if regime_fragility:
+        import logging
+        logging.getLogger(__name__).warning(
+            "%s: Architecture over-optimized for HMM regime definition.",
+            REGIME_FRAGILITY_DETECTED,
+        )
+
+    return {
+        "sharpe_hmm_on": met_on.get("sharpe", np.nan),
+        "sharpe_hmm_off": sharpe_off,
+        "max_dd_hmm_on": met_on.get("max_dd", np.nan),
+        "max_dd_hmm_off": max_dd_off,
+        "cagr_hmm_off": met_off.get("cagr", np.nan),
+        "crisis_sharpes_no_hmm": crisis_sharpes,
+        "regime_fragility_detected": regime_fragility,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7. Falsification Report
+# ---------------------------------------------------------------------------
+
+
+def build_falsification_report(
+    crisis_results: Dict[str, Any],
+    dsr_results: Dict[str, Any],
+    risk_factor_ok: bool,
+    regime_results: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Binary Pass/Fail: PBO, DSR, crisis, risk factors, regime fragility.
+    """
+    fail_reasons: List[str] = []
+    if dsr_results.get("pbo", 0) > PBO_FAIL_THRESHOLD:
+        fail_reasons.append(f"PBO={dsr_results.get('pbo', 0):.1%} > {PBO_FAIL_THRESHOLD:.0%}")
+    if not dsr_results.get("dsr_pass", False):
+        dsr_val = dsr_results.get("dsr", np.nan)
+        fail_reasons.append(f"DSR={dsr_val:.3f} < {DSR_MIN_THRESHOLD}")
+    if crisis_results.get("capacity_limit_required", False):
+        fail_reasons.append("Sharpe<0 in stress period → CAPACITY_LIMIT_REQUIRED")
+    if not risk_factor_ok:
+        fail_reasons.append("Strategy not significant vs risk factors")
+    if regime_results and regime_results.get("regime_fragility_detected", False):
+        fail_reasons.append(
+            f"{REGIME_FRAGILITY_DETECTED}: Sharpe<0 or MaxDD>{REGIME_DD_FAIL_THRESHOLD:.0%} when HMM disabled"
+        )
+
+    passed = len(fail_reasons) == 0
+    return {
+        "PASS": passed,
+        "FAIL_REASONS": fail_reasons,
+        "RECOMMENDATION": "APPROVE" if passed else "REJECT",
+        "CAPACITY_LIMIT_REQUIRED": crisis_results.get("capacity_limit_required", False),
+        "REGIME_FRAGILITY_DETECTED": bool(
+            regime_results and regime_results.get("regime_fragility_detected", False)
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main Report
 # ---------------------------------------------------------------------------
 
@@ -576,7 +831,72 @@ def run_fragility_and_capacity_report() -> Dict[str, Any]:
     print(f"  f* (P(DD>25%)<1%): {dd_kelly['f_constrained']:.4f}")
     print(f"  P(DD>25%) at Kelly: {dd_kelly.get('dd25_prob_at_kelly', np.nan):.1%}")
 
+    # 6. Crisis stress backtests & Kill-switches
+    print("\n--- 6. Crisis stress backtests (isolated periods) ---")
+    crisis_results = run_crisis_stress_backtests(strategy_returns)
+    report["crisis_stress"] = crisis_results
+    for name, w in crisis_results["windows"].items():
+        sh = w["sharpe"]
+        n = w["n_obs"]
+        status = "FAIL (Sharpe<0)" if np.isfinite(sh) and sh < 0 and n >= 5 else "OK"
+        print(f"  {name}: Sharpe={sh:.3f} (n={n}) {status}")
+    if crisis_results.get("capacity_limit_required"):
+        print(f"  >>> {CAPACITY_LIMIT_REQUIRED}: Reduce allowed AUM <<<")
+
+    # 7. DSR from CPCV (Kill-switch 2)
+    print("\n--- 7. Deflated Sharpe Ratio (CPCV) ---")
+    dsr_results = run_dsr_evaluation(strategy_returns)
+    report["dsr_evaluation"] = dsr_results
+    if dsr_results.get("cpcv_ok"):
+        print(f"  DSR: {dsr_results.get('dsr', np.nan):.3f} (min required: {DSR_MIN_THRESHOLD})")
+        print(f"  PBO: {dsr_results.get('pbo', np.nan):.1%} (max {PBO_FAIL_THRESHOLD:.0%})")
+        if not dsr_results.get("dsr_pass"):
+            print(f"  >>> BLOCK: DSR < {DSR_MIN_THRESHOLD} <<<")
+    else:
+        print("  CPCV skipped or failed (insufficient data or error)")
+
+    # Risk factor significance
+    risk_ok, risk_msg = _risk_factor_significance_check(strategy_returns)
+    report["risk_factor_significant"] = risk_ok
+    print(f"  Risk factor significance: {risk_msg}")
+
+    # 8. Regime-Agnostic Stress Test (HMM disabled)
+    print("\n--- 8. Regime-Agnostic Stress Test (Model Independence) ---")
+    regime_results = run_regime_agnostic_stress_test(
+        alpha_df, price_returns, macro_regime_df, news_df, rebalance_dates
+    )
+    report["regime_agnostic_stress"] = regime_results
+    print(f"  Sharpe (HMM on):  {regime_results['sharpe_hmm_on']:.4f}")
+    print(f"  Sharpe (HMM off): {regime_results['sharpe_hmm_off']:.4f}")
+    print(f"  Max DD (HMM on):  {regime_results['max_dd_hmm_on']:.2%}")
+    print(f"  Max DD (HMM off): {regime_results['max_dd_hmm_off']:.2%}")
+    print("  Crisis Sharpes (HMM off):")
+    for name, sh in regime_results["crisis_sharpes_no_hmm"].items():
+        print(f"    {name}: {sh:.3f}")
+    if regime_results["regime_fragility_detected"]:
+        print(f"  >>> {REGIME_FRAGILITY_DETECTED} <<<")
+
+    # Falsification Report (binary Pass/Fail)
+    falsification = build_falsification_report(
+        crisis_results, dsr_results, risk_ok, regime_results
+    )
+    report["falsification_report"] = falsification
+
     print("\n" + "=" * 80)
+    print("FALSIFICATION REPORT — Pipeline Approval")
+    print("=" * 80)
+    status = "PASS" if falsification["PASS"] else "FAIL"
+    print(f"  Result: {status}")
+    print(f"  Recommendation: {falsification['RECOMMENDATION']}")
+    if falsification["FAIL_REASONS"]:
+        print("  Fail reasons:")
+        for r in falsification["FAIL_REASONS"]:
+            print(f"    - {r}")
+    if falsification.get("CAPACITY_LIMIT_REQUIRED"):
+        print(f"  >>> {CAPACITY_LIMIT_REQUIRED}: Force down allowed AUM <<<")
+    if falsification.get("REGIME_FRAGILITY_DETECTED"):
+        print(f"  >>> {REGIME_FRAGILITY_DETECTED} <<<")
+    print("=" * 80)
     print("END OF FRAGILITY & CAPACITY REPORT")
     print("=" * 80)
     return report

@@ -65,6 +65,7 @@ def _load_parquet_or_mock(name: str) -> pd.DataFrame:
                     "date": pd.Timestamp(d),
                     "ticker": f"T_{t:02d}",
                     "PX_LAST": base_px,
+                    "VWAP_CP": base_px * (1.0 + np.random.uniform(-0.002, 0.002)),
                     "PX_TURN_OVER": max(1000.0, float(np.random.lognormal(12, 1))),
                     "BID_ASK_SPREAD_PCT": np.random.uniform(0.005, 0.04),
                 })
@@ -138,17 +139,51 @@ def load_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]
     return prices, fundamentals, macro, news
 
 
-def _build_price_returns_wide(raw_prices: pd.DataFrame) -> pd.DataFrame:
-    """Convert long-format raw prices to wide daily returns for BacktestEngine."""
-    px = raw_prices.copy()
+def _build_price_returns_wide(
+    raw_prices: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Convert long-format raw prices to wide daily returns for BacktestEngine.
+    VWAP-based returns when VWAP_CP available; otherwise PX_LAST.
+    Stale/toxic days → ret=NaN.
+    """
+    from src.layer1_data.feature_engineering import apply_stale_price_handling
+
+    px = apply_stale_price_handling(raw_prices)
     px["date"] = pd.to_datetime(px["date"])
     px = px.sort_values(["ticker", "date"])
-    px["ret"] = px.groupby("ticker")["PX_LAST"].pct_change()
+    if "VWAP_CP" in px.columns:
+        px["ret"] = px.groupby("ticker")["VWAP_CP"].pct_change()
+        px.loc[px["toxic_print_day"], "ret"] = np.nan
+    else:
+        px["ret"] = px.groupby("ticker")["PX_LAST"].pct_change()
+    px.loc[px["is_stale_price"], "ret"] = np.nan
     wide = px.pivot_table(index="date", columns="ticker", values="ret")
-    wide = wide.dropna(how="all").dropna(how="any")
+    wide = wide.dropna(how="all")
     if wide.empty:
         raise ValueError("price_df (returns) is empty after dropping NaNs")
     return wide
+
+
+def _build_is_stale_wide(raw_prices: pd.DataFrame) -> pd.DataFrame:
+    """Build date x ticker is_stale_price for execution blocking."""
+    from src.layer1_data.feature_engineering import apply_stale_price_handling
+
+    px = apply_stale_price_handling(raw_prices)
+    wide = px.pivot_table(index="date", columns="ticker", values="is_stale_price")
+    return wide.fillna(False)
+
+
+def _build_toxic_exec_block_wide(raw_prices: pd.DataFrame) -> pd.DataFrame:
+    """Build date x ticker block_exec: True if is_stale OR toxic_print OR toxicity_block."""
+    from src.layer1_data.feature_engineering import apply_stale_price_handling
+
+    px = apply_stale_price_handling(raw_prices)
+    block = px["is_stale_price"] | px["toxic_print_day"] | px["toxicity_block"]
+    wide = px.assign(block_exec=block).pivot_table(
+        index="date", columns="ticker", values="block_exec"
+    )
+    return wide.fillna(True)
 
 
 def _build_adv_series(raw_prices: pd.DataFrame, window_days: int = 20) -> pd.DataFrame:
@@ -283,6 +318,8 @@ def run_pipeline() -> None:
     # ----- L4 & L5: Backtest -----
     print("\n[L4 & L5] BacktestEngine.run_backtest()...")
     price_returns = _build_price_returns_wide(raw_prices)
+    is_stale_wide = _build_is_stale_wide(raw_prices)
+    toxic_block_wide = _build_toxic_exec_block_wide(raw_prices)
     rebalance_dates = pd.date_range(
         price_returns.index.min() + pd.Timedelta(days=300),
         price_returns.index.max(),
@@ -308,10 +345,57 @@ def run_pipeline() -> None:
     if isinstance(backtest_out, tuple):
         backtest_result, pess_metrics = backtest_out
         print(f"  backtest_result: {len(backtest_result)} weight records")
-        print(f"  Pessimistic Execution — Total_Friction_Cost_BPS: {pess_metrics.get('Total_Friction_Cost_BPS', 0):.1f}, Opportunity_Cost_BPS: {pess_metrics.get('Opportunity_Cost_BPS', 0):.1f}")
+        print(
+            f"  Pessimistic Execution — Total_Friction_Cost_BPS: {pess_metrics.get('Total_Friction_Cost_BPS', 0):.1f}, "
+            f"Opportunity_Cost_BPS: {pess_metrics.get('Opportunity_Cost_BPS', 0):.1f}, "
+            f"Rejected_Sells: {pess_metrics.get('Rejected_Sell_Count', 0)}, "
+            f"Avg_Time_In_Market_Extension_Days: {pess_metrics.get('Avg_Time_In_Market_Extension_Days', 0):.1f}"
+        )
+
+        # Reflexivity Sensitivity (PhD Validation)
+        from src.layer2_regime.liquidity_decay_model import (
+            run_reflexivity_sensitivity,
+            format_reflexivity_report,
+        )
+        from src.layer6_execution.pessimistic_execution import compute_friction_and_opportunity_cost
+
+        adv_for_sim = adv_series if adv_series is not None and not adv_series.empty else pd.DataFrame()
+        if adv_for_sim.empty and "PX_TURN_OVER" in raw_prices.columns:
+            px_tmp = raw_prices.pivot_table(index="date", columns="ticker", values="PX_TURN_OVER")
+            adv_for_sim = px_tmp.rolling(20, min_periods=1).mean()
+
+        def _compute_strat_ret():
+            s, m = compute_friction_and_opportunity_cost(
+                backtest_result,
+                raw_prices,
+                price_returns,
+                alpha_df,
+                macro_regime_df,
+                macro_df,
+                adv_for_sim,
+                portfolio_aum=portfolio_aum_ref,
+                news_df=news_df,
+            )
+            return s, m
+
+        reflex_report = run_reflexivity_sensitivity(_compute_strat_ret)
+        print("\n" + format_reflexivity_report(reflex_report))
     else:
         backtest_result = backtest_out
         print(f"  backtest_result: {len(backtest_result)} weight records")
+
+    # ----- FX Hedging Report (three tracks by regime) -----
+    if "Rates" in macro_df.columns and "Rates_SE" in macro_df.columns:
+        from src.layer5_portfolio.fx_hedging import run_fx_hedging_report, format_fx_hedging_report
+        macro_indexed = macro_df.set_index("date") if "date" in macro_df.columns else macro_df
+        fx_report = run_fx_hedging_report(
+            backtest_result,
+            price_returns,
+            macro_indexed,
+            macro_regime_df,
+            currency_series=None,
+        )
+        print("\n" + format_fx_hedging_report(fx_report))
 
     # ----- L6: Execution & TCA -----
     print("\n[L6] Extracting final target weights and generating orders...")
@@ -348,11 +432,16 @@ def run_pipeline() -> None:
     spreads = spreads.reindex(tickers_common)
     alpha_scores = alpha_scores.reindex(tickers_common)
 
+    is_stale_exec = None
+    if last_price_date in toxic_block_wide.index:
+        is_stale_exec = toxic_block_wide.loc[last_price_date].reindex(tickers_common).fillna(True)
+
     orders = execution_engine.generate_orders(
         target_weights=final_weights,
         current_prices=current_prices,
         spreads=spreads,
         alpha_scores=alpha_scores,
+        is_stale_price=is_stale_exec,
     )
     print(f"  Generated {len(orders)} orders.")
 

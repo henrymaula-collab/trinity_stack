@@ -2,6 +2,11 @@
 Backtest engine orchestrating Layers 2-5 over rebalance dates.
 Strict point-in-time semantics; fail-fast on missing data or index mismatch.
 Supports Pessimistic Execution Engine: T+1 realism, friction and opportunity cost metrics.
+
+Signal Latency & T+1/T+2 Enforcement:
+- Weights dated rb_date (signal day T) are NEVER executed at T's PX_LAST.
+- Execution is strictly at T+1: VWAP_CP on the next trading day.
+- News/sentiment-driven signals incur 50 bps Adverse Selection penalty (first 24h).
 """
 
 from __future__ import annotations
@@ -181,7 +186,12 @@ class BacktestEngine:
         if not records:
             weights_df = pd.DataFrame(columns=["date", "ticker", "target_weight"])
             if use_pessimistic_execution and raw_prices is not None:
-                self._last_pessimistic_metrics = {"Total_Friction_Cost_BPS": 0.0, "Opportunity_Cost_BPS": 0.0}
+                self._last_pessimistic_metrics = {
+                    "Total_Friction_Cost_BPS": 0.0,
+                    "Opportunity_Cost_BPS": 0.0,
+                    "Rejected_Sell_Count": 0,
+                    "Avg_Time_In_Market_Extension_Days": 0.0,
+                }
                 return weights_df, self._last_pessimistic_metrics
             return weights_df
 
@@ -202,6 +212,7 @@ class BacktestEngine:
                 macro_raw_df,
                 adv_for_sim,
                 portfolio_aum=portfolio_aum or 1e6,
+                news_df=news_df,
             )
             self._last_pessimistic_metrics = metrics
             return weights_df, metrics
@@ -215,8 +226,10 @@ class BacktestEngine:
         news_df: pd.DataFrame,
         rebalance_dates: List[pd.Timestamp],
     ) -> None:
-        if price_df.empty or price_df.isna().any().any():
-            raise ValueError("price_df must be non-empty and free of NaNs")
+        if price_df.empty:
+            raise ValueError("price_df must be non-empty")
+        if price_df.isna().all().all():
+            raise ValueError("price_df must have at least some non-NaN returns (stale days may be NaN)")
         for col in ["date", "ticker", "alpha_score"]:
             if col not in alpha_df.columns:
                 raise ValueError(f"alpha_df missing required column: {col}")
